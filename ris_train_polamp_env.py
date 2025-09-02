@@ -9,6 +9,8 @@ import numpy as np
 import random
 import argparse
 import wandb
+import comet_ml
+import tensorflow as tf
 import gym
 from gym.envs.registration import register
 import matplotlib.pyplot as plt
@@ -654,6 +656,10 @@ def train(args=None):
                     name="RIS," 
                             + " Lambda: " + str(args.Lambda) + " alpha: " + str(args.alpha) 
                             + " enc_s: " + str(args.state_dim) + " n_ens: " + str(args.n_ensemble))
+        if args.using_comet:
+            comet_ml.login()
+            comet_ml_experiment = comet_ml.start(project_name="speis")
+            comet_ml_experiment.log_parameters(args)
     else:
         hyperparams_tune = True
         if args.using_wandb:
@@ -926,7 +932,7 @@ def train(args=None):
                                 dataset_validation=args.dataset)
             train_success_rate = sum(logger.data["train_rate"]) / len(logger.data["train_rate"])
             train_collision_rate = sum(logger.data["collision_rate"]) / len(logger.data["collision_rate"])
-            wandb_log_dict = {
+            log_dict = {
                     'steps': logger.data["t"][-1],
                     'train_time': sum(logger.data["train_time"]) / len(logger.data["train_time"]),
                     'train/train_rate': train_success_rate, 
@@ -971,23 +977,6 @@ def train(args=None):
                      'train/log_entropy_sac': sum(logger.data["log_entropy_sac"][-args.eval_freq:]) / args.eval_freq,
                      'train/log_entropy_critic': sum(logger.data["log_entropy_critic"][-args.eval_freq:]) / args.eval_freq,
 
-                     # train logging    
-                    #  'predicted/lidar_data_min': sum(logger.data["predicted_lidar_data_min"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/lidar_data_max': sum(logger.data["predicted_lidar_data_max"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_x_min': sum(logger.data["predicted_subgoal_x_min"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_x_max': sum(logger.data["predicted_subgoal_x_max"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_y_min': sum(logger.data["predicted_subgoal_y_min"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_y_max': sum(logger.data["predicted_subgoal_y_max"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_theta_min': sum(logger.data["predicted_subgoal_theta_min"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_theta_max': sum(logger.data["predicted_subgoal_theta_max"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_v_min': sum(logger.data["predicted_subgoal_v_min"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_v_max': sum(logger.data["predicted_subgoal_v_max"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_steer_min': sum(logger.data["predicted_subgoal_steer_min"][-args.eval_freq:]) / args.eval_freq,    
-                    #  'predicted/subgoal_steer_max': sum(logger.data["predicted_subgoal_steer_max"][-args.eval_freq:]) / args.eval_freq,   
-                    #  'predicted/lidar_predictor_loss_goal': sum(logger.data["lidar_predictor_loss_goal"][-args.eval_freq:]) / args.eval_freq if policy.use_lidar_predictor else 0,    
-                    #  'predicted/lidar_predictor_loss_target_subgoal': sum(logger.data["lidar_predictor_loss_target_subgoal"][-args.eval_freq:]) / args.eval_freq if policy.use_lidar_predictor else 0,    
-                    #  'predicted/lidar_predictor_loss_state': sum(logger.data["lidar_predictor_loss_state"][-args.eval_freq:]) / args.eval_freq if policy.use_lidar_predictor else 0,
-
                      # dubins filter
                      'extra/init_dubins_distance': sum(logger.data["init_dubins_distance"][-args.eval_freq:]) / args.eval_freq,
                      'extra/filtred_dubins_dinstance': sum(logger.data["filtred_dubins_dinstance"][-args.eval_freq:]) / args.eval_freq,
@@ -999,49 +988,19 @@ def train(args=None):
                      f'validation/val_rate({args.n_eval} episodes)': success_rate,
                      f'validation/eval_collisions({args.n_eval} episodes)': validation_info["eval_collisions"],
                      "validation/val_episode_length": eval_episode_length, 
-
-                     # batch state
-                    #  'extra/train_state_x_max': sum(logger.data["train_state_x_max"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_state_x_mean': sum(logger.data["train_state_x_mean"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_state_x_min': sum(logger.data["train_state_x_min"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_state_y_max': sum(logger.data["train_state_y_max"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_state_y_mean': sum(logger.data["train_state_y_mean"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_state_y_min': sum(logger.data["train_state_y_min"][-args.eval_freq:]) / args.eval_freq,
-
-                    #  # batch sampled subgoal
-                    #  'extra/train_subgoal_x_max': sum(logger.data["train_subgoal_x_max"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_x_min': sum(logger.data["train_subgoal_x_min"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_x_mean': sum(logger.data["train_subgoal_x_mean"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_y_max': sum(logger.data["train_subgoal_y_max"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_y_min': sum(logger.data["train_subgoal_y_min"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_y_mean': sum(logger.data["train_subgoal_y_mean"][-args.eval_freq:]) / args.eval_freq,
-
-                    #  # batch sampled goal
-                    #  'extra/train_goal_x_max': sum(logger.data["train_goal_x_max"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_goal_x_min': sum(logger.data["train_goal_x_min"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_goal_x_mean': sum(logger.data["train_goal_x_mean"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_goal_y_max': sum(logger.data["train_goal_y_max"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_goal_y_min': sum(logger.data["train_goal_y_min"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_goal_y_mean': sum(logger.data["train_goal_y_mean"][-args.eval_freq:]) / args.eval_freq,
-
-                    #  # batch sampled goal
-                    #  'extra/train_subgoal_data_x_max': sum(logger.data["train_subgoal_data_x_max"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_data_x_min': sum(logger.data["train_subgoal_data_x_min"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_data_x_mean': sum(logger.data["train_subgoal_data_x_mean"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_data_y_max': sum(logger.data["train_subgoal_data_y_max"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_data_y_min': sum(logger.data["train_subgoal_data_y_min"][-args.eval_freq:]) / args.eval_freq,
-                    #  'extra/train_subgoal_data_y_mean': sum(logger.data["train_subgoal_data_y_mean"][-args.eval_freq:]) / args.eval_freq,
                     } if args.using_wandb else {}
             if args.using_wandb:
                 for dict_ in val_state + val_goal:
                     for key in dict_:
-                        wandb_log_dict[f"{key}"] = dict_[key]
+                        log_dict[f"{key}"] = dict_[key]
                 for map_name, task_indx, video in validation_info["videos"]:
                     cur_step = logger.data["t"][-1]
-                    wandb_log_dict["validation_video"+"_"+map_name+"_"+f"{task_indx}"] = \
+                    log_dict["validation_video"+"_"+map_name+"_"+f"{task_indx}"] = \
                         wandb.Video(video, fps=10, format="gif", caption=f"steps: {cur_step}")
-                wandb.log(wandb_log_dict)
-                del wandb_log_dict
+                wandb.log(log_dict)
+                del log_dict
+            if args.using_comet:
+                comet_ml_experiment.log_parameters(log_dict)
      
             if args.curriculum_high_policy:
                 if train_success_rate >= 0.95:
@@ -1149,7 +1108,8 @@ if __name__ == "__main__":
     parser.add_argument("--update_lambda",             default=1000, type=int)
     
     # logging
-    parser.add_argument("--using_wandb",        default=True, type=bool)
+    parser.add_argument("--using_wandb",        default=False, type=bool)
+    parser.add_argument("--using_comet",        default=True, type=bool)
     parser.add_argument("--wandb_project",      default="safety_ris", type=str)
     parser.add_argument('--log_loss', dest='log_loss', action='store_true')
     parser.add_argument('--no-log_loss', dest='log_loss', action='store_false')
