@@ -1,0 +1,10 @@
+{
+    "collision": 100,
+    "goal": 0.0,
+    "clearance": 0.0,
+    "timeStep": 1.0,
+    "distance": 0.0,
+    "reverse": 0.0,
+    "overSpeeding": 0.0,
+    "overSteering": 0.0
+}  

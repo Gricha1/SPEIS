@@ -1,0 +1,7 @@
+__pycache__
+train_dir
+wandb
+test
+maps
+custom_train_dir
+.vscode/
