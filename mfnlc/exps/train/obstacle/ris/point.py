@@ -42,7 +42,6 @@ def learn(args):
           batch_size=args.batch_size,
           log_interval=4,
           validate_freq=args.validate_freq,
-          use_wandb=True,
           validate=args.validate,
           validate_robot_video=args.validate_robot_video,
           validate_subgoal_video=args.validate_subgoal_video,

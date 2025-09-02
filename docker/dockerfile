@@ -83,6 +83,10 @@ RUN echo "git config --global --add safe.directory /usr/home/workspace" >> ~/.ba
 RUN echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/root/.mujoco/mujoco210/bin" >> ~/.bashrc
 RUN echo "pip install -e ." >> ~/.bashrc
 
+RUN echo "cd /usr/home/workspace/exps" >> ~/.bashrc
+
+RUN echo "export COMET_API_KEY=\"3OfuYHwcRgIwG7DzgzJ190igY\"" >> ~/.bashrc
+
 WORKDIR /usr/home/workspace
 
 ARG WANDB_API_KEY

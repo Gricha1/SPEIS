@@ -109,7 +109,7 @@ zero_base_dict = {'placements_extents': [-1,-1,1,1]}
 goal_all = {
     'task': 'goal',
     'goal_size': 0.3,
-    'goal_keepout': 0.0,
+    'goal_keepout': 0.305,
     'hazards_size': 0.2,
     'hazards_keepout': 0.18,
     }

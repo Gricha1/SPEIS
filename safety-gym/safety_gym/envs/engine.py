@@ -108,15 +108,15 @@ class Engine(gym.Env, gym.utils.EzPickle):
         # Robot
         'robot_placements': None,  # Robot placements list (defaults to full extents)
         'robot_locations': [],  # Explicitly place robot XY coordinate
-        'robot_keepout': 0.0,  # Needs to be set to match the robot XML used
+        'robot_keepout': 0.4,  # Needs to be set to match the robot XML used
         'robot_base': 'xmls/car.xml',  # Which robot XML to use as the base
         'robot_rot': None,  # Override robot starting angle
 
         # Starting position distribution
         'randomize_layout': True,  # If false, set the random seed before layout to constant
         'build_resample': True,  # If true, rejection sample from valid environments
-        'continue_goal': False,  # If true, draw a new goal after achievement
-        'terminate_resample_failure': False,  # If true, end episode when resampling fails,
+        'continue_goal': True,  # If true, draw a new goal after achievement
+        'terminate_resample_failure': True,  # If true, end episode when resampling fails,
                                              # otherwise, raise a python exception.
         # TODO: randomize starting joint positions
 
@@ -1182,13 +1182,18 @@ class Engine(gym.Env, gym.utils.EzPickle):
         # Calculate constraint violations
         if self.constrain_hazards:
             cost['cost_hazards'] = 0
+            cost['clearance_is_enough'] = 0
+            clearance_distance = self.hazards_size + self.robot_keepout
             for h_pos in self.hazards_pos:
                 h_dist = self.dist_xy(h_pos)
                 if h_dist <= self.hazards_size:
                     cost['cost_hazards'] += self.hazards_cost * (self.hazards_size - h_dist)
+                if h_dist <= clearance_distance:
+                    cost['clearance_is_enough'] += 1
 
         # Sum all costs into single total cost
         cost['cost'] = sum(v for k, v in cost.items() if k.startswith('cost_'))
+        cost['clearance_is_enough'] = cost['clearance_is_enough'] > 0
 
         # Optionally remove shaping from reward functions.
         if self.constrain_indicator:
@@ -1243,9 +1248,7 @@ class Engine(gym.Env, gym.utils.EzPickle):
     def step(self, action):
         ''' Take a step and return observation, reward, done, and info '''
         action = np.array(action, copy=False)  # Cast to ndarray
-        # print(f"safety gym action: {action}")
         assert not self.done, 'Environment must be reset before stepping'
-        self.last_action = action
 
         info = {}
 

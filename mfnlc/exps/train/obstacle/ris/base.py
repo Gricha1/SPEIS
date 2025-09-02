@@ -13,6 +13,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.logger import Video
 import wandb
+import comet_ml
 from wandb.integration.sb3 import WandbCallback
 
 from mfnlc.config import get_path, default_device
@@ -84,7 +85,8 @@ def train(env_name,
           reset_num_timesteps: bool = True,
           n_envs: int = 1,
           validate_freq: int = 5000,
-          use_wandb=True,
+          use_wandb=False,
+          use_comet=True,
           validate=False,
           validate_robot_video=False,
           validate_subgoal_video=True,
@@ -109,7 +111,14 @@ def train(env_name,
             sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
             name=wandb_run_name,
         )
-
+    if use_comet:
+        if validate:
+            comet_run_name = f"validate_{algo}_load_model={load_model_folder}"
+        else:
+            comet_run_name = f"train_{algo}"
+        comet_ml.login()
+        comet_ml_experiment = comet_ml.start(project_name="speis")
+        
     if n_envs == 1:
         env = get_env(env_name)
     elif n_envs > 1:
@@ -120,6 +129,214 @@ def train(env_name,
     robot_name = env_name.split("-")[0]
 
     tensorboard_log = get_path(robot_name, algo, "log")
+    
+    class CometCallback(BaseCallback):
+        def __init__(self, 
+                    eval_env: gym.Env, 
+                    comet_experiment: comet_ml.Experiment,
+                    render_freq: int, 
+                    n_eval_episodes: int = 1, 
+                    deterministic: bool = True,
+                    verbose: int = 0,
+                    model_save_path: Optional[str] = None,
+                    model_save_freq: int = 0,
+                    validate_robot_video: bool = False,
+                    validate_subgoal_video: bool = True,
+                    validate_video_idx: int = 0,
+                    add_subgoal_reinforce_sg_num: int = 0):
+            super().__init__(verbose)
+            self._eval_env = eval_env
+            self.comet_experiment = comet_experiment
+            self._render_freq = render_freq
+            self._n_eval_episodes = n_eval_episodes
+            self._deterministic = deterministic
+            self._is_success_buffer = []
+            self._episode_costs = []
+            self.collisions = []
+            self.custom_success_rate = []
+            self.old_success_rate = None
+            self.model_save_path = model_save_path
+            self.model_save_freq = model_save_freq
+            self.validate_robot_video = validate_robot_video
+            self.validate_subgoal_video = validate_subgoal_video
+            self.validate_video_idx = validate_video_idx
+            self.add_subgoal_reinforce_sg_num = add_subgoal_reinforce_sg_num
+
+        def _on_step(self) -> bool:
+            def run_episodes_and_log_comet(validation_dataset=True, num_episodes=self._n_eval_episodes):
+                if validation_dataset:
+                    log_folder_name = "eval"
+                    prefix = "val"
+                else:
+                    log_folder_name = "test"
+                    prefix = "test"
+                
+                robot_screens = []
+                positions_screens = []
+                self._is_success_buffer = []
+                self._episode_costs = []
+                self.collisions = []
+                self.custom_success_rate = []
+                dubug_info = {"acc_reward": 0, "t": 0, "acc_cost": 0}
+                debug_v_s_sg = []
+                debug_v_sg_g = []
+
+                def grab_screens(_locals: Dict[str, Any], _globals: Dict[str, Any]) -> None:
+                    assert len(_locals["env"].envs) == 1
+                    if _locals['done'] and _locals['info']["collision"]:
+                        self.collisions.append(1.0)
+                    elif _locals['done']:
+                        self.collisions.append(0.0)
+                        self.custom_success_rate.append(1.0)
+                    
+                    dubug_info["a0"] = _locals["actions"][0][0]
+                    dubug_info["a1"] = _locals["actions"][0][1]
+                    dubug_info["acc_reward"] += _locals["reward"]
+                    dubug_info["acc_cost"] += _locals["info"]["clearance_is_enough"]
+                    dubug_info["v_s_sg"] = []
+                    dubug_info["v_sg_g"] = []
+                    dubug_info["t"] += 1
+                    
+                    if not self.model.sac:
+                        with th.no_grad():
+                            state = _locals["observations"]["observation"]
+                            goal = _locals["observations"]["desired_goal"]
+                            to_torch_state = th.FloatTensor(state).to(default_device).unsqueeze(0)
+                            to_torch_goal = th.FloatTensor(goal).to(default_device).unsqueeze(0)
+                            
+                            if self.model.use_encoder:
+                                encoded_state = self.model.encoder(to_torch_state)
+                                encoded_goal = self.model.encoder(to_torch_goal)
+                            else:
+                                encoded_state = to_torch_state
+                                encoded_goal = to_torch_goal
+
+                            subgoals = []
+                            _locals["env"].envs[0].setup_subgoals()
+                            plot_subgoals = max(1, self.add_subgoal_reinforce_sg_num)
+                            
+                            for i in range(plot_subgoals):
+                                subgoal_distribution = self.model.subgoal_net(encoded_state, encoded_goal)
+                                subgoal = subgoal_distribution.loc
+                                encoded_goal = subgoal
+                                
+                                if self.model.use_encoder:
+                                    cuda_decoded_subgoal = self.model.policy.encoder.decoder(subgoal)
+                                    decoded_subgoal = cuda_decoded_subgoal.cpu()
+                                else:
+                                    cuda_decoded_subgoal = subgoal
+                                    decoded_subgoal = subgoal.cpu()
+                                    
+                                if self._eval_env.plot_subgoal:
+                                    _locals["env"].envs[0].set_subgoal_pos(i, decoded_subgoal)
+
+                    if _locals["episode_counts"][_locals["i"]] == self.validate_video_idx:
+                        if self.validate_robot_video:
+                            if self._eval_env.plot_only_start_goal_pose:
+                                if dubug_info["t"] == 1:
+                                    screen = self._eval_env.custom_render(positions_render=False)
+                                    robot_screens.append(screen)
+                            else:
+                                screen = self._eval_env.custom_render(positions_render=False)
+                                robot_screens.append(screen)
+                        
+                        if self.validate_subgoal_video:
+                            if self._eval_env.plot_only_start_goal_pose:
+                                if dubug_info["t"] == 1:
+                                    screen = self._eval_env.custom_render(positions_render=True, dubug_info=dubug_info)
+                                    positions_screens.append(screen)
+                            else:
+                                screen = self._eval_env.custom_render(positions_render=True, dubug_info=dubug_info)
+                                positions_screens.append(screen)
+
+                    if _locals["done"]:
+                        maybe_is_success = _locals["info"].get("goal_is_arrived")
+                        if maybe_is_success is not None:
+                            self._is_success_buffer.append(maybe_is_success)
+                        episode_cost = _locals["info"].get("episode_cost")
+                        if episode_cost is not None:
+                            self._episode_costs.append(episode_cost)
+
+                print("---------------- start validation ---------------")
+                print("validation tasks:", num_episodes)
+                self.model.policy.setup_actor_critic()
+                
+                episode_rewards, episode_lengths = evaluate_policy(
+                    self.model,
+                    self._eval_env,
+                    callback=grab_screens,
+                    return_episode_rewards=True,
+                    n_eval_episodes=num_episodes,
+                    deterministic=self._deterministic,
+                )
+
+                # Log videos to Comet ML
+                if self.validate_robot_video and robot_screens:
+                    self.comet_experiment.log_video(
+                        np.array(robot_screens).transpose(0, 3, 1, 2),
+                        name=f"{prefix}_robot_video_step_{self.n_calls}",
+                        fps=10
+                    )
+
+                if self.validate_subgoal_video and positions_screens:
+                    self.comet_experiment.log_video(
+                        np.array(positions_screens).transpose(0, 3, 1, 2),
+                        name=f"{prefix}_subgoal_video_step_{self.n_calls}",
+                        fps=10
+                    )
+
+                # Calculate metrics
+                mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
+                min_reward, max_reward = np.min(episode_rewards), np.max(episode_rewards)
+                mean_ep_length, std_ep_length = np.mean(episode_lengths), np.std(episode_lengths)
+                collision_rate = np.mean(self.collisions) if self.collisions else 0
+                success_rate = np.mean(self._is_success_buffer) if self._is_success_buffer else 0
+                mean_cost = np.mean(self._episode_costs) if self._episode_costs else 0
+
+                # Log metrics to Comet ML
+                metrics = {
+                    f"{prefix}/reward": float(mean_reward),
+                    f"{prefix}/ep_length": mean_ep_length,
+                    f"{prefix}/reward_std": float(std_reward),
+                    f"{prefix}/reward_min": min_reward,
+                    f"{prefix}/reward_max": max_reward,
+                    f"{prefix}/collision_rate": collision_rate,
+                    f"{prefix}/success_rate": success_rate,
+                    f"{prefix}/mean_cost": mean_cost,
+                }
+
+                for metric_name, metric_value in metrics.items():
+                    self.comet_experiment.log_metric(metric_name, metric_value, step=self.n_calls)
+
+                # Also log to console
+                self.logger.record(f"{log_folder_name}/{log_folder_name}_reward", float(mean_reward))
+                self.logger.record(f"{log_folder_name}/{log_folder_name}_ep_length", mean_ep_length)
+                self.logger.record(f"{log_folder_name}/{log_folder_name}_collision_rate", collision_rate)
+                self.logger.record(f"{log_folder_name}/{log_folder_name}_success_rate", success_rate)
+                self.logger.record(f"{log_folder_name}/{log_folder_name}_mean_cost", mean_cost)
+
+                print("---------------- end validation ---------------")
+                return success_rate
+
+            if self.n_calls % self._render_freq == 0:
+                val_success_rate = run_episodes_and_log_comet(validation_dataset=True)
+
+                # Save model
+                if self.model_save_path:
+                    folder = self.model_save_path + "/last_"
+                    os.makedirs(folder, exist_ok=True)
+                    self.model.save(folder)
+
+                    # Save best model
+                    if self.old_success_rate is None or val_success_rate >= self.old_success_rate:
+                        self.old_success_rate = val_success_rate
+                        folder = self.model_save_path + "/best_"
+                        os.makedirs(folder, exist_ok=True)
+                        self.model.save(folder)
+
+                return True
+
+            return True
 
     # add custom video callback
     class VideoRecorderCallback(WandbCallback):
@@ -279,7 +496,10 @@ def train(env_name,
                             prefix = "test_dataset"
                         wandb_log_dict[f"{prefix}_video"] = \
                             wandb.Video(np.array(positions_screens), fps=10, format="gif", caption=f"steps: {self.n_calls}")
-                        run.log(wandb_log_dict)
+                        if use_comet:
+                            comet_ml_experiment.log_parameters(wandb_log_dict)
+                        if use_wandb:    
+                            run.log(wandb_log_dict)
 
                 if validate_robot_video:
                     del robot_screens
@@ -334,7 +554,10 @@ def train(env_name,
                         wandb_log_dict["val_mean_cost"] = mean_cost
                     else:
                         wandb_log_dict["val_mean_cost"] = 0
-                    run.log(wandb_log_dict)
+                    if use_wandb:
+                        run.log(wandb_log_dict)
+                    if use_comet:
+                        comet_ml_experiment.log_parameters(wandb_log_dict)
 
                     print("solved tasks:", self._is_success_buffer)
                     print("custom solved tasks:", self.custom_success_rate)
@@ -394,6 +617,7 @@ def train(env_name,
     run_id = 0
     video_recorder = None
     if use_wandb:
+        assert not use_comet
         run_id = run.id
         video_recorder = VideoRecorderCallback(callback_eval_env, 
                                             n_eval_episodes=len(callback_eval_env.custom_dataset["start"]) if callback_eval_env.is_custom_dataset else 10, 
@@ -402,6 +626,33 @@ def train(env_name,
                                             model_save_path=f"models/{run_id}",
                                             verbose=2)
         wandb.config["model_save_path"] = video_recorder.model_save_path
+        
+    if use_comet:
+        run_id = comet_ml_experiment.get_key()
+        video_recorder = CometCallback(
+            callback_eval_env,
+            comet_ml_experiment,
+            render_freq=validate_freq,
+            n_eval_episodes=len(callback_eval_env.custom_dataset["start"]) if callback_eval_env.is_custom_dataset else 10,
+            model_save_path=f"models/{run_id}",
+            validate_robot_video=validate_robot_video,
+            validate_subgoal_video=validate_subgoal_video,
+            validate_video_idx=validate_video_idx,
+            add_subgoal_reinforce_sg_num=add_subgoal_reinforce_sg_num
+        )
+        comet_ml_experiment.log_parameter("model_save_path", video_recorder.model_save_path)
+    
+    """
+    if use_comet:
+        run_id = comet_ml_experiment.get_key()
+        video_recorder = VideoRecorderCallback(callback_eval_env, 
+                                            n_eval_episodes=len(callback_eval_env.custom_dataset["start"]) if callback_eval_env.is_custom_dataset else 10, 
+                                            render_freq=validate_freq,
+                                            gradient_save_freq=0, # error if > 0 
+                                            model_save_path=f"models/{run_id}",
+                                            verbose=2)
+        wandb.config["model_save_path"] = video_recorder.model_save_path
+    """
         
     print("Ending")
     env_state_dim = env_obs_dim
@@ -475,6 +726,8 @@ def train(env_name,
     # load model
     if use_wandb:
         wandb.config["load_model"] = load_model
+    if use_comet:
+        comet_ml_experiment.log_parameter("load_model", load_model)
     if load_model:
         #folder = "models/m0m2u2vh/"
         folder = f"models/{load_model_folder}/"
