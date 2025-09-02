@@ -62,6 +62,8 @@ RUN pip install numpy==1.23.4
 
 RUN pip install stable-baselines3==1.6.0 --no-deps
 
+RUN pip install comet_ml
+
 # mb rce deps
 #RUN apt-get install libopenmpi-dev
 #ADD requirements.txt /tmp/
