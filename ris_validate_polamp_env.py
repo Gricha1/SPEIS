@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import pathlib
 import json
+import tempfile
 
 import torch
 import numpy as np
@@ -13,6 +14,11 @@ import argparse
 import wandb
 import gym
 from gym.envs.registration import register
+import comet_ml
+try:
+    import imageio
+except ImportError:
+    imageio = None
 
 from utils.logger import Logger
 from polamp_RIS import RIS
@@ -24,6 +30,10 @@ if __name__ == "__main__":
 
     # validation
     parser.add_argument('--not_visual_validation', default=False, action='store_true')
+    parser.add_argument('--plot_trajectory', default=False, action='store_true', help='Plot trajectory without agent visualization')
+    parser.add_argument('--with_noise', default=False, action='store_true', help='Add noise to observations and actions')
+    parser.add_argument('--obs_noise_std', default=0.01, type=float, help='Standard deviation for observation noise')
+    parser.add_argument('--action_noise_std', default=0.01, type=float, help='Standard deviation for action noise')
 
     # environment
     parser.add_argument("--env",                  default="polamp_env")
@@ -77,7 +87,8 @@ if __name__ == "__main__":
     parser.add_argument("--cost_limit",                default=5.0, type=float)
     parser.add_argument("--update_lambda",             default=1000, type=int)
     # logging
-    parser.add_argument("--using_wandb",        default=True, type=bool)
+    parser.add_argument("--using_wandb",        default=False, type=bool)
+    parser.add_argument("--using_comet",        default=True, type=bool)
     parser.add_argument("--wandb_project",      default="validate_ris_polamp", type=str)
     parser.add_argument('--log_loss', dest='log_loss', action='store_true')
     parser.add_argument('--no-log_loss', dest='log_loss', action='store_false')
@@ -116,6 +127,9 @@ if __name__ == "__main__":
     goal_our_env_config["dataset"] = args.dataset
     goal_our_env_config["uniform_feasible_train_dataset"] = args.uniform_feasible_train_dataset
     goal_our_env_config["random_train_dataset"] = args.random_train_dataset
+    goal_our_env_config["with_noise"] = args.with_noise
+    goal_our_env_config["obs_noise_std"] = args.obs_noise_std
+    goal_our_env_config["action_noise_std"] = args.action_noise_std
     if not goal_our_env_config["static_env"]:
         maps["map0"] = []
 
@@ -165,6 +179,11 @@ if __name__ == "__main__":
     logger = None
     if args.using_wandb:
         run = wandb.init(project=args.wandb_project)
+        
+    if args.using_comet:
+        comet_ml.login()
+        comet_ml_experiment = comet_ml.start(project_name="speis")
+        comet_ml_experiment.log_parameters(args)
     
     # Initialize policy
     env_state_bounds = {"x": 100, "y": 100, 
@@ -243,19 +262,166 @@ if __name__ == "__main__":
                                 dataset_plot=False,
                                 dataset_validation=args.dataset,
                                 full_validation=True,
-                                skip_not_video_tasks=False)
+                                skip_not_video_tasks=False,
+                                plot_trajectory=args.plot_trajectory,
+                                with_noise=args.with_noise,
+                                obs_noise_std=args.obs_noise_std,
+                                action_noise_std=args.action_noise_std)
     wandb_log_dict = {}
     wandb_log_dict[f'validation/val_rate({args.n_eval} episodes)'] = success_rate
+    wandb_log_dict[f'validation/eval_reward({args.n_eval} episodes)'] = eval_reward
+    wandb_log_dict[f'validation/eval_distance({args.n_eval} episodes)'] = eval_distance
+    wandb_log_dict[f'validation/eval_episode_length({args.n_eval} episodes)'] = eval_episode_length
+    
+    # Log scalar metrics from validation_info (skip non-scalar values like lists, dicts, etc.)
+    scalar_keys = ["eval_cost", "eval_collisions", "eval_min_clearance", "eval_mean_clearance"]
+    for val_key in scalar_keys:
+        if val_key in validation_info:
+            wandb_log_dict[f"validation/{val_key}({args.n_eval} episodes)"] = validation_info[val_key]
+    
+    # Log other scalar values from validation_info (but skip complex structures)
     for val_key in validation_info:
-        wandb_log_dict["validation/"+val_key] = validation_info[val_key]
+        if val_key not in scalar_keys and val_key not in ["videos", "trajectory", "task_statuses", "unsuccessful_tasks", "action_info"]:
+            val = validation_info[val_key]
+            # Only log scalar values (numbers)
+            if isinstance(val, (int, float, np.integer, np.floating)):
+                wandb_log_dict[f"validation/{val_key}({args.n_eval} episodes)"] = float(val)
     if not args.not_visual_validation:
         for map_name, task_indx, video in validation_info["videos"]:
             wandb_log_dict["validation_video"+"_"+map_name+"_"+f"{task_indx}"] = wandb.Video(video, fps=10, format="gif")
+    
+    # Add trajectory images to wandb
+    if args.plot_trajectory and "trajectory" in validation_info:
+        for map_name, task_indx, trajectory_image in validation_info["trajectory"]:
+            # Convert numpy array to PIL Image for wandb
+            import PIL.Image
+            if len(trajectory_image.shape) == 3:
+                pil_image = PIL.Image.fromarray(trajectory_image)
+                wandb_log_dict[f"validation_trajectory_{map_name}_{task_indx}"] = wandb.Image(pil_image)
+    
     if args.using_wandb:
         run.log(wandb_log_dict)
-    print("validation success rate:", success_rate)
-    # print("action info:", validation_info["action_info"])
-    #print("validation_info:", validation_info)
-    #print([task[1] for task in validation_info if task[2] == "success"])
+        
+    
+    print("validation_info keys:", validation_info.keys())
+    
+    # Log metrics to comet_ml (even if not_visual_validation is set, metrics should be logged)
+    if args.using_comet:
+        # Log scalar metrics
+        comet_metrics = {
+            "validation/success_rate": success_rate,
+            "validation/eval_reward": eval_reward,
+            "validation/eval_distance": eval_distance,
+            "validation/eval_episode_length": eval_episode_length,
+        }
+        if "eval_cost" in validation_info:
+            comet_metrics["validation/eval_cost"] = validation_info["eval_cost"]
+        if "eval_collisions" in validation_info:
+            comet_metrics["validation/eval_collisions"] = validation_info["eval_collisions"]
+        if "eval_min_clearance" in validation_info:
+            comet_metrics["validation/eval_min_clearance"] = validation_info["eval_min_clearance"]
+        if "eval_mean_clearance" in validation_info:
+            comet_metrics["validation/eval_mean_clearance"] = validation_info["eval_mean_clearance"]
+        if "eval_subgoal_collision_rate" in validation_info:
+            comet_metrics["validation/eval_subgoal_collision_rate"] = validation_info["eval_subgoal_collision_rate"]
+        comet_ml_experiment.log_metrics(comet_metrics)
+    
+    if args.using_comet and not args.not_visual_validation:
+        for map_name, task_indx, video in validation_info["videos"]:
+            # Video is in format (T, C, H, W) from ris_train_polamp_env.py line 555
+            # Convert to (T, H, W, C) format for saving
+            if len(video.shape) == 4:
+                if video.shape[1] == 3 or video.shape[1] == 1:  # (T, C, H, W) with C=3 or C=1
+                    video_to_save = np.transpose(video, (0, 2, 3, 1))  # (T, H, W, C)
+                elif video.shape[3] == 3 or video.shape[3] == 1:  # Already (T, H, W, C)
+                    video_to_save = video
+                else:
+                    # Assume (T, H, W) grayscale
+                    video_to_save = np.expand_dims(video, axis=-1) if len(video.shape) == 3 else video
+            else:
+                video_to_save = video
+            
+            # Ensure video is uint8 in range [0, 255]
+            if video_to_save.dtype != np.uint8:
+                if video_to_save.max() <= 1.0:
+                    video_to_save = (video_to_save * 255).astype(np.uint8)
+                else:
+                    video_to_save = np.clip(video_to_save, 0, 255).astype(np.uint8)
+            
+            # Remove single channel dimension if grayscale
+            if len(video_to_save.shape) == 4 and video_to_save.shape[3] == 1:
+                video_to_save = video_to_save.squeeze(axis=3)
+            
+            # Save video to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
+                tmp_video_path = tmp_file.name
+            
+            try:
+                if imageio is not None:
+                    # imageio.mimwrite expects (T, H, W, C) or (T, H, W) for grayscale
+                    imageio.mimwrite(tmp_video_path, video_to_save, fps=10, codec='libx264')
+                else:
+                    # Fallback: save as GIF using PIL if imageio is not available
+                    import PIL.Image
+                    if len(video_to_save.shape) == 3:  # Grayscale (T, H, W)
+                        frames = [PIL.Image.fromarray(frame, mode='L') for frame in video_to_save]
+                    else:  # Color (T, H, W, C)
+                        frames = [PIL.Image.fromarray(frame) for frame in video_to_save]
+                    frames[0].save(tmp_video_path.replace('.mp4', '.gif'), 
+                                 save_all=True, append_images=frames[1:], 
+                                 duration=100, loop=0)
+                    tmp_video_path = tmp_video_path.replace('.mp4', '.gif')
+                
+                comet_ml_experiment.log_video(
+                    tmp_video_path,
+                    name=f"validation_video_{map_name}_{task_indx}",
+                    overwrite=True
+                )
+            finally:
+                # Clean up temporary file
+                if os.path.exists(tmp_video_path):
+                    os.unlink(tmp_video_path)
+    
+    # Log trajectory images to comet_ml
+    if args.using_comet and args.plot_trajectory and "trajectory" in validation_info:
+        for map_name, task_indx, trajectory_image in validation_info["trajectory"]:
+            # Save trajectory image to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                tmp_image_path = tmp_file.name
+            
+            try:
+                import PIL.Image
+                pil_image = PIL.Image.fromarray(trajectory_image)
+                pil_image.save(tmp_image_path)
+                
+                comet_ml_experiment.log_image(
+                    tmp_image_path,
+                    name=f"validation_trajectory_{map_name}_{task_indx}",
+                    overwrite=True
+                )
+            finally:
+                # Clean up temporary file
+                if os.path.exists(tmp_image_path):
+                    os.unlink(tmp_image_path)
+    
+    # Print all validation metrics
+    print("=" * 60)
+    print("VALIDATION METRICS:")
+    print("=" * 60)
+    print(f"Success Rate: {success_rate:.4f}")
+    print(f"Eval Reward: {eval_reward:.4f}")
+    print(f"Eval Distance: {eval_distance:.4f}")
+    print(f"Eval Episode Length: {eval_episode_length:.4f}")
+    if "eval_cost" in validation_info:
+        print(f"Eval Cost: {validation_info['eval_cost']:.4f}")
+    if "eval_collisions" in validation_info:
+        print(f"Eval Collisions: {validation_info['eval_collisions']:.4f}")
+    if "eval_min_clearance" in validation_info:
+        print(f"Eval Min Clearance: {validation_info['eval_min_clearance']:.4f}")
+    if "eval_mean_clearance" in validation_info:
+        print(f"Eval Mean Clearance: {validation_info['eval_mean_clearance']:.4f}")
+    if "eval_subgoal_collision_rate" in validation_info:
+        print(f"Eval Subgoal Collision Rate: {validation_info['eval_subgoal_collision_rate']:.4f}")
+    print("=" * 60)
 
     

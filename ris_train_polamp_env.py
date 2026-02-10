@@ -15,6 +15,7 @@ import gym
 from gym.envs.registration import register
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.path import Path as MPLPath
 
 from polamp_env.lib.utils_operations import normalizeAngle
 from utils.logger import Logger
@@ -44,7 +45,11 @@ def evalPolicy(policy, env,
                skip_not_video_tasks=False,
                plot_only_start_position=False,
                dataset_validation=None,
-               full_validation=False):
+               full_validation=False,
+               plot_trajectory=False,
+               with_noise=False,
+               obs_noise_std=0.01,
+               action_noise_std=0.01):
     """
         medium dataset: video_validate_tasks = [("map4", 8), ("map4", 13), ("map6", 5), ("map6", 18), ("map7", 19), ("map5", 7)]
         hard dataset: video_validate_tasks = [("map0", 2), ("map0", 5), ("map0", 10), ("map0", 15)]
@@ -129,6 +134,8 @@ def evalPolicy(policy, env,
                 for k in range(tasks_per_patern):
                     video_validate_tasks.append(("map0", j+k))
     dataset_plot_is_already_visualized = False
+    # Track subgoal collisions across all episodes
+    all_subgoals_collision = []  # List of collision status for all subgoals across all episodes
     for val_key in env.maps.keys():
         eval_tasks = len(env.valTasks[val_key])
         for task_id in range(eval_tasks):  
@@ -144,18 +151,37 @@ def evalPolicy(policy, env,
             obs = env.reset(id=task_id, val_key=val_key)
             info = {}
             agent = env.environment.agent.current_state
-            goal = env.environment.agent.goal_state
+            goal_state = env.environment.agent.goal_state  # Save goal_state before it gets overwritten
             info["agent_state"] = [agent.x, agent.y, agent.theta, agent.v, agent.steer]
-            info["goal_state"] = [goal.x, goal.y, goal.theta, goal.v, goal.steer]
+            info["goal_state"] = [goal_state.x, goal_state.y, goal_state.theta, goal_state.v, goal_state.steer]
             done = False
             state = obs["observation"]
             goal = obs["desired_goal"]
+            
+            # Add noise to initial observation if with_noise is enabled
+            if with_noise:
+                obs_noise = np.random.normal(0, obs_noise_std, size=state.shape)
+                state = state + obs_noise
+            
             t = 0
             acc_reward = 0
             acc_cost = 0
             acc_collision = 0
             min_clearance_distances = []
             state_distrs["start_x"].append(state[0])
+            
+            # Collect trajectory for plot_trajectory
+            trajectory_x = []
+            trajectory_y = []
+            if plot_trajectory:
+                trajectory_x.append(agent.x)
+                trajectory_y.append(agent.y)
+            
+            # Collect subgoals generated during episode
+            subgoals_x = []
+            subgoals_y = []
+            subgoals_theta = []
+            subgoals_collision = []  # Track collision status for each subgoal
 
             while not done:
                 if plot_full_env and need_to_plot_task:
@@ -465,11 +491,72 @@ def evalPolicy(policy, env,
                 goal_dists["goal_v"].append(goal[3])
                 goal_dists["goal_steer"].append(goal[4])
                 
+                # Generate and save subgoal position before selecting action
+                # Always generate subgoal for collision checking, but only save positions if plot_trajectory is True
+                with torch.no_grad():
+                    to_torch_state = torch.FloatTensor(state).to(policy.device).unsqueeze(0)
+                    to_torch_goal = torch.FloatTensor(goal).to(policy.device).unsqueeze(0)
+                    if policy.use_encoder:
+                        encoded_state = policy.encoder(to_torch_state)
+                        encoded_goal = policy.encoder(to_torch_goal)
+                    else:
+                        encoded_state = to_torch_state
+                        encoded_goal = to_torch_goal
+                    
+                    # Generate subgoal
+                    subgoal_distribution = policy.subgoal_net(encoded_state, encoded_goal)
+                    subgoal = subgoal_distribution.loc
+                    if policy.high_level_without_frame:
+                        subgoal = subgoal.repeat(1, 4)
+                    if policy.use_lidar_predictor:
+                        subgoal = policy.add_lidar_data_to_subgoals(subgoal, encoded_state, encoded_goal)
+                    
+                    # Decode subgoal to get position (same logic as in plot_subgoals)
+                    if policy.use_encoder:
+                        cuda_decoded_subgoal = policy.encoder.decoder(subgoal)
+                        decoded_subgoal = cuda_decoded_subgoal.cpu()
+                    else:
+                        cuda_decoded_subgoal = subgoal
+                        decoded_subgoal = subgoal.cpu()
+                    
+                    # Extract x, y, theta from decoded subgoal
+                    subgoal_x = decoded_subgoal[0][0].item()
+                    subgoal_y = decoded_subgoal[0][1].item()
+                    subgoal_theta = decoded_subgoal[0][2].item()
+                    
+                    # Save positions only if plot_trajectory is True
+                    if plot_trajectory:
+                        subgoals_x.append(subgoal_x)
+                        subgoals_y.append(subgoal_y)
+                        subgoals_theta.append(subgoal_theta)
+                    
+                    # Check if subgoal is in collision with obstacles (always check for metric)
+                    # Save current agent state
+                    original_state = env.environment.agent.current_state
+                    # Create subgoal state (use default v and steer from original state)
+                    subgoal_state = State([subgoal_x, subgoal_y, subgoal_theta, original_state.v, original_state.steer])
+                    # Temporarily set agent state to subgoal to check collision
+                    env.environment.agent.current_state = subgoal_state
+                    # Check collision
+                    is_collision = env.environment.is_robot_in_collision()
+                    # Restore original state
+                    env.environment.agent.current_state = original_state
+                    
+                    subgoals_collision.append(is_collision)
+                
                 if eval_strategy is None:
                     action = policy.select_deterministic_action(state, goal)
                 else:
                     print("EVAL ACTION = ", eval_strategy)
                     action = eval_strategy
+                
+                # Add noise to action if with_noise is enabled
+                if with_noise:
+                    action_noise = np.random.normal(0, action_noise_std, size=action.shape)
+                    action = action + action_noise
+                    # Clip action to valid range [-1, 1]
+                    action = np.clip(action, -1.0, 1.0)
+                
                 if action_info["max_linear_acc"] is None:
                     action_info["max_linear_acc"] = action[0]
                     action_info["max_steer_rate"] = action[1]
@@ -491,7 +578,19 @@ def evalPolicy(policy, env,
                 acc_collision += 1.0 * ("Collision" in info)
                 
                 next_state = next_obs["observation"]
+                
+                # Add noise to observation if with_noise is enabled
+                if with_noise:
+                    obs_noise = np.random.normal(0, obs_noise_std, size=next_state.shape)
+                    next_state = next_state + obs_noise
+                
                 state = next_state
+                
+                # Collect trajectory coordinates
+                if plot_trajectory:
+                    current_agent = env.environment.agent.current_state
+                    trajectory_x.append(current_agent.x)
+                    trajectory_y.append(current_agent.y)
 
                 if render_env and need_to_plot_task:
                     images.append(env.render())
@@ -526,6 +625,192 @@ def evalPolicy(policy, env,
                 lst_mean_clearance_distances.append(np.mean(min_clearance_distances))
                 if acc_collision > 0.5 or success < 0.5:
                     lst_unsuccessful_tasks.append((val_key, task_id, task_status))
+            
+            # Plot trajectory if requested
+            if plot_trajectory and len(trajectory_x) > 0:
+                env_min_x = env.dataset_info["min_x"]
+                env_max_x = env.dataset_info["max_x"]
+                env_min_y = env.dataset_info["min_y"]
+                env_max_y = env.dataset_info["max_y"]
+                
+                fig_traj = plt.figure(figsize=[6.4, 4.8])
+                ax_traj = fig_traj.add_subplot(111)
+                
+                # Plot obstacles
+                if plot_obstacles:
+                    # Use maximum safe distance from safe_vehicle_array for expansion
+                    # This defines the boundary where agent starts getting cost (clearance_is_enough = False)
+                    if hasattr(env.environment.agent, 'safe_vehicle_array') and len(env.environment.agent.safe_vehicle_array) > 0:
+                        expansion_distance = np.max(env.environment.agent.safe_vehicle_array)
+                    else:
+                        expansion_distance = env.environment.agent.dynamic_model.safe_eps
+                    
+                    # Reduce expansion by half - take distance between red and blue rectangles and divide by 2
+                    expansion_distance = expansion_distance / 4
+                    
+                    for obstacle in env.environment.obstacle_segments:
+                        # Get obstacle corners in order
+                        corners = [
+                            [obstacle[0][0].x, obstacle[0][0].y],
+                            [obstacle[1][0].x, obstacle[1][0].y],
+                            [obstacle[2][0].x, obstacle[2][0].y],
+                            [obstacle[3][0].x, obstacle[3][0].y]
+                        ]
+                        
+                        # Draw original obstacle boundaries (blue lines)
+                        for i in range(4):
+                            p1 = corners[i]
+                            p2 = corners[(i + 1) % 4]
+                            ax_traj.scatter(np.linspace(p1[0], p2[0], 500), 
+                                            np.linspace(p1[1], p2[1], 500), 
+                                            color="blue", s=1, zorder=2)
+                        
+                        # Calculate center of obstacle
+                        center_x = np.mean([c[0] for c in corners])
+                        center_y = np.mean([c[1] for c in corners])
+                        
+                        # Calculate width and height of original obstacle
+                        # Find min and max x, y coordinates
+                        x_coords = [c[0] for c in corners]
+                        y_coords = [c[1] for c in corners]
+                        min_x = np.min(x_coords)
+                        max_x = np.max(x_coords)
+                        min_y = np.min(y_coords)
+                        max_y = np.max(y_coords)
+                        
+                        width = max_x - min_x
+                        height = max_y - min_y
+                        
+                        # Expand width and height by 2 * expansion_distance (both sides)
+                        # expansion_distance is already halved, so this creates a smaller expansion
+                        expanded_width = width + 2 * expansion_distance
+                        expanded_height = height + 2 * expansion_distance
+                        
+                        # Calculate expanded rectangle corners (centered at the same center)
+                        expanded_min_x = center_x - expanded_width / 2
+                        expanded_max_x = center_x + expanded_width / 2
+                        expanded_min_y = center_y - expanded_height / 2
+                        expanded_max_y = center_y + expanded_height / 2
+                        
+                        # Create expanded rectangle corners
+                        expanded_corners = [
+                            [expanded_min_x, expanded_min_y],
+                            [expanded_max_x, expanded_min_y],
+                            [expanded_max_x, expanded_max_y],
+                            [expanded_min_x, expanded_max_y]
+                        ]
+                        
+                        # Draw expanded rectangle boundaries (red lines) - dangerous zone
+                        for i in range(4):
+                            p1 = expanded_corners[i]
+                            p2 = expanded_corners[(i + 1) % 4]
+                            # Don't add label to scatter - will add separately for legend
+                            ax_traj.scatter(np.linspace(p1[0], p2[0], 500), 
+                                            np.linspace(p1[1], p2[1], 500), 
+                                            color="red", s=1, zorder=2)
+                
+                # Add legend entry for Dangerous zone with large marker (only once)
+                if plot_obstacles and len(env.environment.obstacle_segments) > 0:
+                    ax_traj.plot([], [], marker='o', color='red', markersize=15, 
+                               markeredgecolor='red', markeredgewidth=1, linestyle='None', label='Dangerous zone')
+                
+                # Plot trajectory as orange dots (without label)
+                ax_traj.scatter(trajectory_x, trajectory_y, color="orange", s=10, alpha=0.6, zorder=3)
+                
+                # Add legend entry for Trajectory with large marker
+                ax_traj.plot([], [], marker='o', color='orange', markersize=15, 
+                           markeredgecolor='orange', markeredgewidth=1, linestyle='None', label='Trajectory')
+                
+                # Plot all subgoals generated during episode
+                if len(subgoals_x) > 0:
+                    ax_traj.scatter(subgoals_x, subgoals_y, color="purple", s=50, alpha=0.8, 
+                                  marker='*', zorder=4, edgecolors='purple', linewidths=0.5)
+                    # Draw direction arrows for subgoals
+                    car_length = 0.5
+                    for sg_x, sg_y, sg_theta in zip(subgoals_x, subgoals_y, subgoals_theta):
+                        arrow_length = car_length * 0.8
+                        ax_traj.arrow(sg_x, sg_y, 
+                                     arrow_length * np.cos(sg_theta), 
+                                     arrow_length * np.sin(sg_theta),
+                                     head_width=0.1, head_length=0.1, 
+                                     fc='purple', ec='purple', alpha=0.6, zorder=4)
+                    
+                    # Add legend entry for Subgoals
+                    ax_traj.plot([], [], marker='*', color='purple', markersize=15, 
+                               markeredgecolor='purple', markeredgewidth=0.5, linestyle='None', label='Subgoals')
+                
+                # Plot initial position - draw the car (agentBB)
+                start_x = agent.x
+                start_y = agent.y
+                start_theta = agent.theta
+                start_state = State([start_x, start_y, start_theta, agent.v, agent.steer])
+                center_start_state = env.environment.agent.dynamic_model.shift_state(start_state)
+                start_agentBB = env.environment.getBB(center_start_state, ego=True)
+                # Draw car bounding box
+                ax_traj.scatter(np.linspace(start_agentBB[0][0].x, start_agentBB[0][1].x, 500), 
+                               np.linspace(start_agentBB[0][0].y, start_agentBB[0][1].y, 500), 
+                               color="green", s=2, zorder=6)
+                ax_traj.scatter(np.linspace(start_agentBB[1][0].x, start_agentBB[1][1].x, 500), 
+                               np.linspace(start_agentBB[1][0].y, start_agentBB[1][1].y, 500), 
+                               color="green", s=2, zorder=6)
+                ax_traj.scatter(np.linspace(start_agentBB[2][0].x, start_agentBB[2][1].x, 500), 
+                               np.linspace(start_agentBB[2][0].y, start_agentBB[2][1].y, 500), 
+                               color="green", s=2, zorder=6)
+                ax_traj.scatter(np.linspace(start_agentBB[3][0].x, start_agentBB[3][1].x, 500), 
+                               np.linspace(start_agentBB[3][0].y, start_agentBB[3][1].y, 500), 
+                               color="green", s=2, zorder=6)
+                
+                # Draw green arrow for agent direction at start position
+                car_length = 1.5
+                start_arrow_dx = car_length * np.cos(start_theta)
+                start_arrow_dy = car_length * np.sin(start_theta)
+                ax_traj.arrow(start_x, start_y, start_arrow_dx, start_arrow_dy, 
+                             head_width=0.2, head_length=0.15, fc='green', ec='green', 
+                             linewidth=2, zorder=7, length_includes_head=True)
+                
+                # Plot goal position - yellow circle with black border and green arrow (larger size)
+                goal_x = info["goal_state"][0]
+                goal_y = info["goal_state"][1]
+                goal_theta = info["goal_state"][2]
+                
+                # Draw yellow circle with black border (larger size)
+                circle_radius = 1.0
+                circle = patches.Circle((goal_x, goal_y), circle_radius, color='yellow', ec='black', linewidth=2, zorder=7)
+                ax_traj.add_patch(circle)
+                # Add label separately using plot for proper circle display in legend
+                ax_traj.plot([], [], marker='o', color='w', markerfacecolor='yellow', 
+                            markeredgecolor='black', markersize=10, markeredgewidth=2, label='Goal')
+                
+                # Draw green arrow for goal direction
+                car_length = 1.5
+                goal_arrow_dx = car_length * np.cos(goal_theta)
+                goal_arrow_dy = car_length * np.sin(goal_theta)
+                ax_traj.arrow(goal_x, goal_y, goal_arrow_dx, goal_arrow_dy, 
+                             head_width=0.2, head_length=0.15, fc='green', ec='green', 
+                             linewidth=2, zorder=8, length_includes_head=True)
+                
+                ax_traj.set_ylim(bottom=env_min_y, top=env_max_y)
+                ax_traj.set_xlim(left=env_min_x, right=env_max_x)
+                ax_traj.set_xlabel("X")
+                ax_traj.set_ylabel("Y")
+                ax_traj.set_title(f"Trajectory - Map: {val_key}, Task: {task_id}, Status: {task_status}")
+                ax_traj.legend()
+                ax_traj.grid(False)
+                
+                # Convert figure to numpy array
+                fig_traj.canvas.draw()
+                trajectory_image = np.frombuffer(fig_traj.canvas.tostring_rgb(), dtype=np.uint8)
+                trajectory_image = trajectory_image.reshape(fig_traj.canvas.get_width_height()[::-1] + (3,))
+                plt.close(fig_traj)
+                
+                # Store trajectory image in validation_info
+                if "trajectory" not in validation_info:
+                    validation_info["trajectory"] = []
+                validation_info["trajectory"].append((val_key, task_id, trajectory_image))
+            
+            # Collect subgoal collision information for this episode
+            if len(subgoals_collision) > 0:
+                all_subgoals_collision.extend(subgoals_collision)
 
     eval_distance = np.mean(final_distances) 
     success_rate = np.mean(successes)
@@ -562,6 +847,17 @@ def evalPolicy(policy, env,
     validation_info["eval_collisions"] = eval_collisions
     validation_info["eval_min_clearance"] = eval_min_clearance
     validation_info["eval_mean_clearance"] = eval_mean_clearance
+    
+    # Compute subgoal collision metric
+    # Metric is 1.0 if all subgoals are in collision, 0.0 if none are in collision
+    if len(all_subgoals_collision) > 0:
+        # Fraction of subgoals that are in collision
+        subgoal_collision_rate = np.mean(all_subgoals_collision)
+        validation_info["eval_subgoal_collision_rate"] = subgoal_collision_rate
+        print(f"Subgoal collision metric: {subgoal_collision_rate:.4f} (total subgoals: {len(all_subgoals_collision)})")
+    else:
+        validation_info["eval_subgoal_collision_rate"] = 0.0
+        print("Warning: No subgoals were generated during validation, eval_subgoal_collision_rate set to 0.0")
 
     return eval_distance, success_rate, eval_reward, \
            [state_distrs, max_state_vals, min_state_vals], \
@@ -648,6 +944,9 @@ def sample_and_preprocess_batch(replay_buffer, env, batch_size=256, device=torch
     return state_batch, action_batch, reward_batch, cost_batch, next_state_batch, done_batch, goal_batch
 
 def train(args=None):   
+    # Initialize comet_ml_experiment to None
+    comet_ml_experiment = None
+    
     # chech if hyperparams tuning
     if type(args) == type(argparse.Namespace()):
         hyperparams_tune = False
@@ -659,7 +958,11 @@ def train(args=None):
         if args.using_comet:
             comet_ml.login()
             comet_ml_experiment = comet_ml.start(project_name="speis")
-            comet_ml_experiment.log_parameters(args)
+            # Convert args to dict for logging parameters
+            if hasattr(args, '__dict__'):
+                comet_ml_experiment.log_parameters(vars(args))
+            else:
+                comet_ml_experiment.log_parameters(args)
     else:
         hyperparams_tune = True
         if args.using_wandb:
@@ -692,7 +995,7 @@ def train(args=None):
         total_maps = 2
     else:
         total_maps = 1
-    dataSet = generateDataSet(our_env_config, name_folder="goal_polamp_env/"+args.dataset, total_maps=total_maps, dynamic=False)
+    dataSet = generateDataSet(our_env_config, name_folder=args.dataset, total_maps=total_maps, dynamic=False)
     maps, trainTask, valTasks = dataSet["obstacles"]
     goal_our_env_config["dataset"] = args.dataset
     goal_our_env_config["uniform_feasible_train_dataset"] = args.uniform_feasible_train_dataset
@@ -812,6 +1115,12 @@ def train(args=None):
     done = False
     state = obs["observation"]
     goal = obs["desired_goal"]
+    
+    # Add noise to initial observation if with_noise is enabled
+    if args.with_noise:
+        obs_noise = np.random.normal(0, args.obs_noise_std, size=state.shape)
+        state = state + obs_noise
+    
     episode_timesteps = 0
     episode_num = 0 
     old_success_rate = None
@@ -836,11 +1145,26 @@ def train(args=None):
             action = env.action_space.sample()
         else:
             action = policy.select_action(state, goal)
+        
+        # Add noise to action if with_noise is enabled
+        if args.with_noise:
+            action_noise = np.random.normal(0, args.action_noise_std, size=action.shape)
+            action = action + action_noise
+            # Clip action to valid range [-1, 1]
+            action = np.clip(action, -1.0, 1.0)
 
         # Perform action
         next_obs, reward, done, train_info = env.step(action) 
         next_state = next_obs["observation"]
         next_agent_state = next_obs["state_observation"]
+        
+        # Add noise to observation if with_noise is enabled
+        if args.with_noise:
+            obs_noise = np.random.normal(0, args.obs_noise_std, size=next_state.shape)
+            next_state = next_state + obs_noise
+            # Update next_obs with noisy observation
+            next_obs["observation"] = next_state
+        
         cumulative_reward += reward
         cumulative_cost += train_info["cost"]
 
@@ -898,6 +1222,12 @@ def train(args=None):
             done = False
             state = obs["observation"]
             goal = obs["desired_goal"]
+            
+            # Add noise to observation if with_noise is enabled
+            if args.with_noise:
+                obs_noise = np.random.normal(0, args.obs_noise_std, size=state.shape)
+                state = state + obs_noise
+            
             episode_timesteps = 0
             episode_num += 1 
             logger.store(dataset_x = state[0])
@@ -919,6 +1249,10 @@ def train(args=None):
                                 plot_decoder_agent_states=False,
                                 plot_subgoal_dispertion=True,
                                 plot_lidar_predictor=False,
+                                with_noise=args.with_noise,
+                                obs_noise_std=args.obs_noise_std,
+                                action_noise_std=args.action_noise_std,
+                                plot_trajectory=args.plot_trajectory,
                                 data_to_plot={"train_step_x": logger.data["train_step_x"], 
                                               "train_step_y": logger.data["train_step_y"],
                                               "dataset_x": logger.data["dataset_x"],
@@ -930,6 +1264,21 @@ def train(args=None):
                                 dataset_plot=True,
                                 skip_not_video_tasks=False,
                                 dataset_validation=args.dataset)
+            
+            # Print validation metrics to console
+            print("=" * 60)
+            print("VALIDATION METRICS (Training):")
+            print("=" * 60)
+            print(f"Success Rate: {success_rate:.4f}")
+            print(f"Collision Rate: {validation_info.get('eval_collisions', 0.0):.4f}")
+            print(f"Cost: {validation_info.get('eval_cost', 0.0):.4f}")
+            if "eval_subgoal_collision_rate" in validation_info:
+                print(f"Subgoal Collision Rate: {validation_info['eval_subgoal_collision_rate']:.4f}")
+            print(f"Episode Length: {eval_episode_length:.4f}")
+            print(f"Distance: {eval_distance:.4f}")
+            print(f"Reward: {eval_reward:.4f}")
+            print("=" * 60)
+            
             train_success_rate = sum(logger.data["train_rate"]) / len(logger.data["train_rate"])
             train_collision_rate = sum(logger.data["collision_rate"]) / len(logger.data["collision_rate"])
             log_dict = {
@@ -987,20 +1336,117 @@ def train(args=None):
                      f'validation/eval_cost({args.n_eval} episodes)': validation_info["eval_cost"],
                      f'validation/val_rate({args.n_eval} episodes)': success_rate,
                      f'validation/eval_collisions({args.n_eval} episodes)': validation_info["eval_collisions"],
-                     "validation/val_episode_length": eval_episode_length, 
-                    } if args.using_wandb else {}
+                     "validation/val_episode_length": eval_episode_length,
+                     f'validation/eval_subgoal_collision_rate({args.n_eval} episodes)': validation_info.get("eval_subgoal_collision_rate", 0.0), 
+                    } if (args.using_wandb or args.using_comet) else {}
+            cur_step = logger.data["t"][-1]
             if args.using_wandb:
                 for dict_ in val_state + val_goal:
                     for key in dict_:
                         log_dict[f"{key}"] = dict_[key]
                 for map_name, task_indx, video in validation_info["videos"]:
-                    cur_step = logger.data["t"][-1]
                     log_dict["validation_video"+"_"+map_name+"_"+f"{task_indx}"] = \
                         wandb.Video(video, fps=10, format="gif", caption=f"steps: {cur_step}")
+                # Log trajectory images to wandb
+                if args.plot_trajectory and "trajectory" in validation_info:
+                    import PIL.Image
+                    for map_name, task_indx, trajectory_image in validation_info["trajectory"]:
+                        if len(trajectory_image.shape) == 3:
+                            pil_image = PIL.Image.fromarray(trajectory_image)
+                            log_dict[f"validation_trajectory_{map_name}_{task_indx}_step_{cur_step}"] = wandb.Image(pil_image)
                 wandb.log(log_dict)
-                del log_dict
-            if args.using_comet:
-                comet_ml_experiment.log_parameters(log_dict)
+            if args.using_comet and comet_ml_experiment is not None:
+                # Add val_state and val_goal metrics for comet_ml
+                for dict_ in val_state + val_goal:
+                    for key in dict_:
+                        log_dict[f"{key}"] = dict_[key]
+                
+                # Remove 'steps' from metrics dict (it's not a metric, it's the step number)
+                # Also remove wandb.Video objects (they're wandb-specific)
+                comet_metrics = {k: v for k, v in log_dict.items() 
+                                if k != 'steps' 
+                                and not (hasattr(v, '__class__') and 'wandb' in str(type(v)))}
+                
+                # Log metrics to comet_ml with step number
+                if len(comet_metrics) > 0:
+                    try:
+                        comet_ml_experiment.log_metrics(comet_metrics, step=cur_step)
+                    except Exception as e:
+                        print(f"Warning: Failed to log metrics to Comet ML: {e}")
+                # Also log videos if available
+                if not args.not_visual_validation and "videos" in validation_info:
+                    for map_name, task_indx, video in validation_info["videos"]:
+                        cur_step = logger.data["t"][-1]
+                        # Convert video format if needed
+                        if len(video.shape) == 4:
+                            if video.shape[1] == 3 or video.shape[1] == 1:  # (T, C, H, W)
+                                video_to_save = np.transpose(video, (0, 2, 3, 1))  # (T, H, W, C)
+                            else:
+                                video_to_save = video
+                        else:
+                            video_to_save = video
+                        
+                        # Ensure video is uint8
+                        if video_to_save.dtype != np.uint8:
+                            if video_to_save.max() <= 1.0:
+                                video_to_save = (video_to_save * 255).astype(np.uint8)
+                            else:
+                                video_to_save = np.clip(video_to_save, 0, 255).astype(np.uint8)
+                        
+                        # Save video to temporary file
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
+                            tmp_video_path = tmp_file.name
+                        
+                        try:
+                            try:
+                                import imageio
+                                if imageio is not None:
+                                    imageio.mimwrite(tmp_video_path, video_to_save, fps=10, codec='libx264')
+                                else:
+                                    raise ImportError
+                            except (ImportError, Exception):
+                                import PIL.Image
+                                if len(video_to_save.shape) == 3:
+                                    frames = [PIL.Image.fromarray(frame, mode='L') for frame in video_to_save]
+                                else:
+                                    frames = [PIL.Image.fromarray(frame) for frame in video_to_save]
+                                frames[0].save(tmp_video_path.replace('.mp4', '.gif'), 
+                                             save_all=True, append_images=frames[1:], 
+                                             duration=100, loop=0)
+                                tmp_video_path = tmp_video_path.replace('.mp4', '.gif')
+                            
+                            comet_ml_experiment.log_video(
+                                tmp_video_path,
+                                name=f"validation_video_{map_name}_{task_indx}_step_{cur_step}",
+                                overwrite=True
+                            )
+                        finally:
+                            if os.path.exists(tmp_video_path):
+                                os.unlink(tmp_video_path)
+                # Log trajectory images to comet_ml
+                if args.plot_trajectory and "trajectory" in validation_info:
+                    for map_name, task_indx, trajectory_image in validation_info["trajectory"]:
+                        # Save trajectory image to temporary file
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                            tmp_image_path = tmp_file.name
+                        
+                        try:
+                            import PIL.Image
+                            pil_image = PIL.Image.fromarray(trajectory_image)
+                            pil_image.save(tmp_image_path)
+                            
+                            comet_ml_experiment.log_image(
+                                tmp_image_path,
+                                name=f"validation_trajectory_{map_name}_{task_indx}_step_{cur_step}",
+                                overwrite=True
+                            )
+                        finally:
+                            # Clean up temporary file
+                            if os.path.exists(tmp_image_path):
+                                os.unlink(tmp_image_path)
+            del log_dict
      
             if args.curriculum_high_policy:
                 if train_success_rate >= 0.95:
@@ -1062,6 +1508,10 @@ if __name__ == "__main__":
     # validate
     parser.add_argument("--eval_freq",          default=int(3e4), type=int) # 3e4
     parser.add_argument('--not_visual_validation', default=False, action='store_true')
+    parser.add_argument('--plot_trajectory', default=False, action='store_true', help='Plot trajectory with subgoals during validation')
+    parser.add_argument('--with_noise', default=False, action='store_true', help='Add noise to observations and actions during training')
+    parser.add_argument('--obs_noise_std', default=0.01, type=float, help='Standard deviation for observation noise')
+    parser.add_argument('--action_noise_std', default=0.01, type=float, help='Standard deviation for action noise')
 
     # ris
     parser.add_argument("--epsilon",            default=1e-16, type=float)

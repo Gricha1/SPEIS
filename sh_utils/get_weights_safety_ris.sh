@@ -1,5 +1,7 @@
 #https://drive.google.com/file/d/1F3eoNlQsRY_D0Npp95jKbHBFFZO43JcU/view?usp=drive_link
 
+apt update && apt install -y curl unzip
+
 google_drive_id=1F3eoNlQsRY_D0Npp95jKbHBFFZO43JcU
 save_to_folder=results/polamp_env/RIS/final_weights
 file_name=polamp_env_ris_safety.zip

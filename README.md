@@ -28,6 +28,19 @@ sh validate_safety_ris_dataset_2.sh
 ```
 
 # Train
+## RIS (Risk-Informed Subgoal)
 ```commandline
 sh train_safety_ris.sh
 ```
+
+## SAC-Lagrangian (SAC with safety constraints)
+```commandline
+sh train_sac_lagrangian.sh
+```
+
+Key parameters for SAC-Lagrangian:
+- `--train_sac True`: Enable SAC mode (instead of RIS)
+- `--safety True`: Enable safety constraints (Lagrangian multiplier)
+- `--cost_limit 5.0`: Cost limit for safety constraint
+- `--update_lambda 1000`: Frequency of lambda (Lagrangian multiplier) updates
+- `--lambda_initialization 1.0`: Initial value for lambda
