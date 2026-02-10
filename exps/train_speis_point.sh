@@ -7,4 +7,4 @@ export COMET_API_KEY="3OfuYHwcRgIwG7DzgzJ190igY"
 #pip install 'shimmy>=0.2.1' --quiet 2>/dev/null || true
 
 cd ../mfnlc
-python exps/train/obstacle/ris/point.py
+python exps/train/obstacle/ris/point.py --obs_noise_std 0.05 --action_noise_std 0.05
