@@ -47,7 +47,9 @@ def learn(args):
           validate_subgoal_video=args.validate_subgoal_video,
           validate_video_idx=args.validate_video_idx,
           load_model=args.load_model,
-          load_model_folder=args.load_model_folder)
+          load_model_folder=args.load_model_folder,
+          obs_noise_std=args.obs_noise_std,
+          action_noise_std=args.action_noise_std)
 
 
 def evaluate_controller():
@@ -81,6 +83,9 @@ if __name__ == '__main__':
     parser.add_argument("--no_safety", action='store_true', default=False)
     parser.add_argument("--safe_critic_behave", default="min", type=str)
     parser.add_argument("--cost_limit", default=3.0, type=float)
+    # noise
+    parser.add_argument("--obs_noise_std", default=0.0, type=float, help="Standard deviation of Gaussian noise added to observations")
+    parser.add_argument("--action_noise_std", default=0.0, type=float, help="Standard deviation of Gaussian noise added to actions")
     args = parser.parse_args()    
     
     assert args.safe_critic_behave in ["min", "max", "mean"]

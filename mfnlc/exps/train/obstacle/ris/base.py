@@ -92,7 +92,9 @@ def train(env_name,
           validate_subgoal_video=True,
           validate_video_idx=0,
           load_model=False,
-          load_model_folder=""
+          load_model_folder="",
+          obs_noise_std=0.0,
+          action_noise_std=0.0
           ):
     algo = "ris"
     if validate:
@@ -125,6 +127,11 @@ def train(env_name,
         env = get_sub_proc_env(env_name, n_envs)
     else:
         raise ValueError(f"n_envs should be greater than 0, but it is {n_envs}")
+    
+    # Add noise wrapper if noise is enabled
+    if obs_noise_std > 0 or action_noise_std > 0:
+        from mfnlc.envs.base import NoiseWrapper
+        env = NoiseWrapper(env, obs_noise_std=obs_noise_std, action_noise_std=action_noise_std)
 
     robot_name = env_name.split("-")[0]
 
@@ -600,6 +607,11 @@ def train(env_name,
         callback_eval_env = get_env(env_name)
     else:
         assert 1 == 0
+    
+    # Add noise wrapper to eval env if noise is enabled
+    if obs_noise_std > 0 or action_noise_std > 0:
+        from mfnlc.envs.base import NoiseWrapper
+        callback_eval_env = NoiseWrapper(callback_eval_env, obs_noise_std=obs_noise_std, action_noise_std=action_noise_std)
 
     # test eval env
     obs = callback_eval_env.reset()
@@ -712,7 +724,6 @@ def train(env_name,
         dict(
             n_sampled_goal=4,
             goal_selection_strategy=goal_selection_strategy,
-            online_sampling=True,
         ), # replay_buffer_kwargs
         optimize_memory_usage, ent_coef, target_update_interval, target_entropy, 
         use_sde, sde_sample_freq, use_sde_at_warmup, 
@@ -739,8 +750,7 @@ def train(env_name,
     else:
         print("WEIGHTS ISN'T LOADED")
     
-    model.learn(total_timesteps, video_recorder, log_interval, eval_env, eval_freq,
-                n_eval_episodes, tb_log_name, eval_log_path, reset_num_timesteps)
+    model.learn(total_timesteps=total_timesteps, callback=video_recorder, log_interval=log_interval)
 
     model_path = get_path(robot_name, algo, "model")
     os.makedirs(os.path.dirname(model_path), exist_ok=True)

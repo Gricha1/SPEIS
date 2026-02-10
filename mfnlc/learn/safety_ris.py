@@ -187,10 +187,20 @@ class SafetyRis(SAC):
 
         if _init_setup_model:
             self._setup_model()
+        
+        # Ensure _stats_window_size is set (required by stable_baselines3)
+        # This is normally set in _setup_model, but we ensure it's set here
+        if not hasattr(self, '_stats_window_size') or self._stats_window_size is None:
+            self._stats_window_size = 100
 
     def _setup_model(self) -> None:
         super(SafetyRis, self)._setup_model()
         self._setup_alias()
+        
+        # Ensure _stats_window_size is set after setup (required by stable_baselines3)
+        if not hasattr(self, '_stats_window_size') or not isinstance(self._stats_window_size, int):
+            self._stats_window_size = 100
+    
 
     def _setup_alias(self) -> None:
         # setup new actor critic
@@ -244,7 +254,21 @@ class SafetyRis(SAC):
         if "Nav" in env.envs[0].env.robot_name: 
             done_batch   = 1.0 * (reward_batch <= env.envs[0].env.arrive_radius)# terminal condition
         else:
-            done_batch   = 1.0 * (reward_batch <= env.envs[0].env.env.goal_size)# terminal condition
+            # For SafetyGym environments, try to get goal_size from different locations
+            env_obj = env.envs[0].env
+            goal_threshold = None
+            # Try different paths to get goal_size or arrive_radius
+            if hasattr(env_obj, 'arrive_radius'):
+                goal_threshold = env_obj.arrive_radius
+            elif hasattr(env_obj, 'env') and hasattr(env_obj.env, 'goal_size'):
+                goal_threshold = env_obj.env.goal_size
+            elif hasattr(env_obj, 'goal_size'):
+                goal_threshold = env_obj.goal_size
+            else:
+                # Fallback: use default goal size for SafetyGym
+                goal_threshold = 0.3
+            
+            done_batch = 1.0 * (reward_batch <= goal_threshold)
 
         # done_batch   = 1.0 * (reward_batch <= env.envs[0].env.env.goal_size) + \
         #     1.0 * (np.sqrt(np.power(np.array(next_state_batch)[:, -e_v:-i_v], 2).sum(-1, keepdims=True)) > 0.1)

@@ -768,3 +768,50 @@ class ObstacleMaskWrapper(gym.Wrapper):
     def step(self, action):
         _, r, d, info = super(ObstacleMaskWrapper, self).step(action)
         return self.get_obs(), r, d, info
+
+
+class NoiseWrapper(gym.Wrapper):
+    """
+    Wrapper to add Gaussian noise to observations and actions
+    """
+    def __init__(self, env, obs_noise_std=0.0, action_noise_std=0.0):
+        super(NoiseWrapper, self).__init__(env)
+        self.obs_noise_std = obs_noise_std
+        self.action_noise_std = action_noise_std
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        if self.obs_noise_std > 0:
+            if isinstance(obs, dict):
+                # For dict observations (e.g., {"observation": ..., "desired_goal": ...})
+                for key in obs:
+                    if isinstance(obs[key], np.ndarray):
+                        obs[key] = obs[key] + np.random.normal(0, self.obs_noise_std, size=obs[key].shape)
+            else:
+                # For array observations
+                obs = obs + np.random.normal(0, self.obs_noise_std, size=obs.shape)
+        return obs
+
+    def step(self, action):
+        # Add noise to action before applying it
+        if self.action_noise_std > 0:
+            action_noise = np.random.normal(0, self.action_noise_std, size=action.shape)
+            action = action + action_noise
+            # Clip action to valid range
+            if hasattr(self.env, 'action_space'):
+                action = np.clip(action, self.env.action_space.low, self.env.action_space.high)
+        
+        obs, reward, done, info = self.env.step(action)
+        
+        # Add noise to observation after step
+        if self.obs_noise_std > 0:
+            if isinstance(obs, dict):
+                # For dict observations
+                for key in obs:
+                    if isinstance(obs[key], np.ndarray):
+                        obs[key] = obs[key] + np.random.normal(0, self.obs_noise_std, size=obs[key].shape)
+            else:
+                # For array observations
+                obs = obs + np.random.normal(0, self.obs_noise_std, size=obs.shape)
+        
+        return obs, reward, done, info
