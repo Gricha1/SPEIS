@@ -110,20 +110,25 @@ class RIS(object):
 												  without_state_goal=self.without_state_goal).to(device)
 			self.lidar_predictor_criterion = nn.MSELoss()
 			self.lidar_predictor_optimizer = torch.optim.Adam(self.lidar_predictor.predictor.parameters(), lr=enc_lr)
-		# Subgoal policy 
+		# Subgoal policy (only for RIS, not for SAC)
 		self.high_level_without_frame = False
 		self.use_dubins_filter = use_dubins_filter
 		self.curvature = vehicle_curvature
 		if train_sac:
 			self.high_level_without_frame = False
 			self.use_dubins_filter = False
-		if self.high_level_without_frame:
+			# Don't create subgoal_net for SAC-Lagrangian
+			self.subgoal_net = None
+			self.subgoal_optimizer = None
+		else:
+			# Create subgoal_net only for RIS
+			if self.high_level_without_frame:
 				self.subgoal_net = LaplacePolicy(state_dim=state_dim, 
 											goal_dim=self.subgoal_dim if self.use_lidar_predictor else state_dim).to(device)
-		else:
-			self.subgoal_net = LaplacePolicy(state_dim=state_dim, 
+			else:
+				self.subgoal_net = LaplacePolicy(state_dim=state_dim, 
 											goal_dim=self.subgoal_dim*self.frame_stack if self.use_lidar_predictor else state_dim).to(device)
-		self.subgoal_optimizer = torch.optim.Adam(self.subgoal_net.parameters(), lr=h_lr)
+			self.subgoal_optimizer = torch.optim.Adam(self.subgoal_net.parameters(), lr=h_lr)
 
 		# Encoder
 		self.add_obs_noise = add_obs_noise
@@ -170,7 +175,9 @@ class RIS(object):
 		torch.save(self.critic.state_dict(),		folder + "critic.pth")
 		if self.safety:
 			torch.save(self.critic_cost.state_dict(),		folder + "critic_cost.pth")
-		torch.save(self.subgoal_net.state_dict(),   folder + "subgoal_net.pth")
+		# Only save subgoal_net if it exists (i.e., not for SAC-Lagrangian)
+		if self.subgoal_net is not None:
+			torch.save(self.subgoal_net.state_dict(),   folder + "subgoal_net.pth")
 		if self.use_encoder:
 			torch.save(self.encoder.state_dict(), folder + "encoder.pth")
 		if self.use_lidar_predictor:
@@ -178,7 +185,8 @@ class RIS(object):
 		if save_optims:
 			torch.save(self.actor_optimizer.state_dict(), 	folder + "actor_opti.pth")
 			torch.save(self.critic_optimizer.state_dict(), 	folder + "critic_opti.pth")
-			torch.save(self.subgoal_optimizer.state_dict(), folder + "subgoal_opti.pth")
+			if self.subgoal_optimizer is not None:
+				torch.save(self.subgoal_optimizer.state_dict(), folder + "subgoal_opti.pth")
 			if self.use_encoder:
 				torch.save(self.encoder_optimizer.state_dict(), folder + "encoder_opti")
 
@@ -192,7 +200,9 @@ class RIS(object):
 		self.critic.load_state_dict(torch.load(folder+run_name+"critic.pth", map_location=self.device))
 		if self.safety:
 			self.critic_cost.load_state_dict(torch.load(folder+run_name+"critic_cost.pth", map_location=self.device))
-		self.subgoal_net.load_state_dict(torch.load(folder+run_name+"subgoal_net.pth", map_location=self.device))
+		# Only load subgoal_net if it exists (i.e., not for SAC-Lagrangian)
+		if self.subgoal_net is not None:
+			self.subgoal_net.load_state_dict(torch.load(folder+run_name+"subgoal_net.pth", map_location=self.device))
 		if self.use_encoder:
 			self.encoder.load_state_dict(torch.load(folder+run_name+"encoder.pth", map_location=self.device))
 		if self.use_lidar_predictor:
@@ -329,20 +339,25 @@ class RIS(object):
 		action_dist = self.actor(state, goal)
 		action = action_dist.rsample()
 
-		with torch.no_grad():
-			subgoal = self.sample_subgoal(state, goal)
-		if self.use_dubins_filter:
-			subgoal, init_dubins_distance, filtred_dubins_dinstance = self.dubins_filter_subgoals(state, subgoal, goal, 5)
-		if self.logger is not None:
-			self.logger.store(
-				init_dubins_distance = init_dubins_distance if self.use_dubins_filter else 0,
-				filtred_dubins_dinstance = filtred_dubins_dinstance if self.use_dubins_filter else 0,
-			)
-		
-		prior_action_dist = self.actor_target(state.unsqueeze(1).expand(batch_size, subgoal.size(1), self.state_dim), subgoal)
-		prior_prob = prior_action_dist.log_prob(action.unsqueeze(1).expand(batch_size, subgoal.size(1), self.action_dim)).sum(-1, keepdim=True).exp()
-		prior_log_prob = torch.log(prior_prob.mean(1) + self.epsilon)
-		D_KL = action_dist.log_prob(action).sum(-1, keepdim=True) - prior_log_prob
+		# Only use subgoals if subgoal_net exists (i.e., for RIS, not for SAC/SAC-Lagrangian)
+		if self.subgoal_net is not None:
+			with torch.no_grad():
+				subgoal = self.sample_subgoal(state, goal)
+			if self.use_dubins_filter:
+				subgoal, init_dubins_distance, filtred_dubins_dinstance = self.dubins_filter_subgoals(state, subgoal, goal, 5)
+			if self.logger is not None:
+				self.logger.store(
+					init_dubins_distance = init_dubins_distance if self.use_dubins_filter else 0,
+					filtred_dubins_dinstance = filtred_dubins_dinstance if self.use_dubins_filter else 0,
+				)
+			
+			prior_action_dist = self.actor_target(state.unsqueeze(1).expand(batch_size, subgoal.size(1), self.state_dim), subgoal)
+			prior_prob = prior_action_dist.log_prob(action.unsqueeze(1).expand(batch_size, subgoal.size(1), self.action_dim)).sum(-1, keepdim=True).exp()
+			prior_log_prob = torch.log(prior_prob.mean(1) + self.epsilon)
+			D_KL = action_dist.log_prob(action).sum(-1, keepdim=True) - prior_log_prob
+		else:
+			# For SAC/SAC-Lagrangian: D_KL = 0 (no subgoal-based prior)
+			D_KL = torch.zeros(batch_size, 1).to(self.device)
 
 		action = torch.tanh(action)
 		return action, D_KL
@@ -657,10 +672,11 @@ class RIS(object):
 					lambda_multiplier = lambda_multiplier.item(),
 				)
 
-		""" High-level policy learning """
-		if self.use_lidar_predictor:
-			self.train_lidar_predictor(env_state, env_subgoal, env_goal)
-		self.train_highlevel_policy(state, goal, subgoal)
+		""" High-level policy learning (only for RIS, not for SAC/SAC-Lagrangian) """
+		if self.subgoal_net is not None:
+			if self.use_lidar_predictor:
+				self.train_lidar_predictor(env_state, env_subgoal, env_goal)
+			self.train_highlevel_policy(state, goal, subgoal)
 
 		""" Actor """
 		# Sample action

@@ -33,6 +33,15 @@ sh validate_safety_ris_dataset_2.sh
 sh train_safety_ris.sh
 ```
 
+## SAC (Soft Actor-Critic without safety constraints)
+```commandline
+sh train_sac.sh
+```
+
+Key parameters for SAC:
+- `--train_sac True`: Enable SAC mode (instead of RIS)
+- `--safety False`: Disable safety constraints (pure SAC)
+
 ## SAC-Lagrangian (SAC with safety constraints)
 ```commandline
 sh train_sac_lagrangian.sh

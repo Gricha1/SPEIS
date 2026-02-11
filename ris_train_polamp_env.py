@@ -492,57 +492,58 @@ def evalPolicy(policy, env,
                 goal_dists["goal_steer"].append(goal[4])
                 
                 # Generate and save subgoal position before selecting action
-                # Always generate subgoal for collision checking, but only save positions if plot_trajectory is True
-                with torch.no_grad():
-                    to_torch_state = torch.FloatTensor(state).to(policy.device).unsqueeze(0)
-                    to_torch_goal = torch.FloatTensor(goal).to(policy.device).unsqueeze(0)
-                    if policy.use_encoder:
-                        encoded_state = policy.encoder(to_torch_state)
-                        encoded_goal = policy.encoder(to_torch_goal)
-                    else:
-                        encoded_state = to_torch_state
-                        encoded_goal = to_torch_goal
-                    
-                    # Generate subgoal
-                    subgoal_distribution = policy.subgoal_net(encoded_state, encoded_goal)
-                    subgoal = subgoal_distribution.loc
-                    if policy.high_level_without_frame:
-                        subgoal = subgoal.repeat(1, 4)
-                    if policy.use_lidar_predictor:
-                        subgoal = policy.add_lidar_data_to_subgoals(subgoal, encoded_state, encoded_goal)
-                    
-                    # Decode subgoal to get position (same logic as in plot_subgoals)
-                    if policy.use_encoder:
-                        cuda_decoded_subgoal = policy.encoder.decoder(subgoal)
-                        decoded_subgoal = cuda_decoded_subgoal.cpu()
-                    else:
-                        cuda_decoded_subgoal = subgoal
-                        decoded_subgoal = subgoal.cpu()
-                    
-                    # Extract x, y, theta from decoded subgoal
-                    subgoal_x = decoded_subgoal[0][0].item()
-                    subgoal_y = decoded_subgoal[0][1].item()
-                    subgoal_theta = decoded_subgoal[0][2].item()
-                    
-                    # Save positions only if plot_trajectory is True
-                    if plot_trajectory:
-                        subgoals_x.append(subgoal_x)
-                        subgoals_y.append(subgoal_y)
-                        subgoals_theta.append(subgoal_theta)
-                    
-                    # Check if subgoal is in collision with obstacles (always check for metric)
-                    # Save current agent state
-                    original_state = env.environment.agent.current_state
-                    # Create subgoal state (use default v and steer from original state)
-                    subgoal_state = State([subgoal_x, subgoal_y, subgoal_theta, original_state.v, original_state.steer])
-                    # Temporarily set agent state to subgoal to check collision
-                    env.environment.agent.current_state = subgoal_state
-                    # Check collision
-                    is_collision = env.environment.is_robot_in_collision()
-                    # Restore original state
-                    env.environment.agent.current_state = original_state
-                    
-                    subgoals_collision.append(is_collision)
+                # Only for RIS (not for SAC-Lagrangian)
+                if hasattr(policy, 'subgoal_net') and policy.subgoal_net is not None:
+                    with torch.no_grad():
+                        to_torch_state = torch.FloatTensor(state).to(policy.device).unsqueeze(0)
+                        to_torch_goal = torch.FloatTensor(goal).to(policy.device).unsqueeze(0)
+                        if policy.use_encoder:
+                            encoded_state = policy.encoder(to_torch_state)
+                            encoded_goal = policy.encoder(to_torch_goal)
+                        else:
+                            encoded_state = to_torch_state
+                            encoded_goal = to_torch_goal
+                        
+                        # Generate subgoal
+                        subgoal_distribution = policy.subgoal_net(encoded_state, encoded_goal)
+                        subgoal = subgoal_distribution.loc
+                        if policy.high_level_without_frame:
+                            subgoal = subgoal.repeat(1, 4)
+                        if policy.use_lidar_predictor:
+                            subgoal = policy.add_lidar_data_to_subgoals(subgoal, encoded_state, encoded_goal)
+                        
+                        # Decode subgoal to get position (same logic as in plot_subgoals)
+                        if policy.use_encoder:
+                            cuda_decoded_subgoal = policy.encoder.decoder(subgoal)
+                            decoded_subgoal = cuda_decoded_subgoal.cpu()
+                        else:
+                            cuda_decoded_subgoal = subgoal
+                            decoded_subgoal = subgoal.cpu()
+                        
+                        # Extract x, y, theta from decoded subgoal
+                        subgoal_x = decoded_subgoal[0][0].item()
+                        subgoal_y = decoded_subgoal[0][1].item()
+                        subgoal_theta = decoded_subgoal[0][2].item()
+                        
+                        # Save positions only if plot_trajectory is True
+                        if plot_trajectory:
+                            subgoals_x.append(subgoal_x)
+                            subgoals_y.append(subgoal_y)
+                            subgoals_theta.append(subgoal_theta)
+                        
+                        # Check if subgoal is in collision with obstacles (only for RIS)
+                        # Save current agent state
+                        original_state = env.environment.agent.current_state
+                        # Create subgoal state (use default v and steer from original state)
+                        subgoal_state = State([subgoal_x, subgoal_y, subgoal_theta, original_state.v, original_state.steer])
+                        # Temporarily set agent state to subgoal to check collision
+                        env.environment.agent.current_state = subgoal_state
+                        # Check collision
+                        is_collision = env.environment.is_robot_in_collision()
+                        # Restore original state
+                        env.environment.agent.current_state = original_state
+                        
+                        subgoals_collision.append(is_collision)
                 
                 if eval_strategy is None:
                     action = policy.select_deterministic_action(state, goal)
@@ -848,16 +849,19 @@ def evalPolicy(policy, env,
     validation_info["eval_min_clearance"] = eval_min_clearance
     validation_info["eval_mean_clearance"] = eval_mean_clearance
     
-    # Compute subgoal collision metric
-    # Metric is 1.0 if all subgoals are in collision, 0.0 if none are in collision
-    if len(all_subgoals_collision) > 0:
-        # Fraction of subgoals that are in collision
-        subgoal_collision_rate = np.mean(all_subgoals_collision)
-        validation_info["eval_subgoal_collision_rate"] = subgoal_collision_rate
-        print(f"Subgoal collision metric: {subgoal_collision_rate:.4f} (total subgoals: {len(all_subgoals_collision)})")
-    else:
-        validation_info["eval_subgoal_collision_rate"] = 0.0
-        print("Warning: No subgoals were generated during validation, eval_subgoal_collision_rate set to 0.0")
+    # Compute subgoal collision metric (only for RIS, not for SAC-Lagrangian)
+    # Only compute if subgoal_net exists (i.e., for RIS)
+    if hasattr(policy, 'subgoal_net') and policy.subgoal_net is not None:
+        # Metric is 1.0 if all subgoals are in collision, 0.0 if none are in collision
+        if len(all_subgoals_collision) > 0:
+            # Fraction of subgoals that are in collision
+            subgoal_collision_rate = np.mean(all_subgoals_collision)
+            validation_info["eval_subgoal_collision_rate"] = subgoal_collision_rate
+            print(f"Subgoal collision metric: {subgoal_collision_rate:.4f} (total subgoals: {len(all_subgoals_collision)})")
+        else:
+            validation_info["eval_subgoal_collision_rate"] = 0.0
+            print("Warning: No subgoals were generated during validation, eval_subgoal_collision_rate set to 0.0")
+    # For SAC-Lagrangian, don't compute or add this metric
 
     return eval_distance, success_rate, eval_reward, \
            [state_distrs, max_state_vals, min_state_vals], \
@@ -1291,29 +1295,31 @@ def train(args=None):
                     'train/max_cumulative_reward': max(logger.data["cumulative_reward"]),
                     'train/min_cumulative_reward': min(logger.data["cumulative_reward"]),
                     'train/avg_cumulative_cost': sum(logger.data["cumulative_cost"]) / len(logger.data["cumulative_cost"]),
-                    'train/autoencoder_loss': sum(logger.data["autoencoder_loss"][-args.eval_freq:]) / args.eval_freq,
-                    'train/v1_v2_diff': sum(logger.data["v1_v2_diff"][-args.eval_freq:]) / args.eval_freq,
-                    'train/high_policy_v': sum(logger.data["high_policy_v"][-args.eval_freq:]) / args.eval_freq,    
-                    'train/high_v': sum(logger.data["high_v"][-args.eval_freq:]) / args.eval_freq,   
-                    'train/train_adv': sum(logger.data["adv"][-args.eval_freq:]) / args.eval_freq,    
+                    'train/autoencoder_loss': sum(logger.data["autoencoder_loss"][-args.eval_freq:]) / args.eval_freq if policy.use_decoder and "autoencoder_loss" in logger.data and len(logger.data["autoencoder_loss"]) > 0 else 0,
+                    # High-level policy metrics (only for RIS, not for SAC/SAC-Lagrangian)
+                    'train/v1_v2_diff': sum(logger.data["v1_v2_diff"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "v1_v2_diff" in logger.data and len(logger.data["v1_v2_diff"]) > 0 else 0,
+                    'train/high_policy_v': sum(logger.data["high_policy_v"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "high_policy_v" in logger.data and len(logger.data["high_policy_v"]) > 0 else 0,    
+                    'train/high_v': sum(logger.data["high_v"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "high_v" in logger.data and len(logger.data["high_v"]) > 0 else 0,   
+                    'train/train_adv': sum(logger.data["adv"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "adv" in logger.data and len(logger.data["adv"]) > 0 else 0,    
                     'train/train_D_KL': sum(logger.data["D_KL"][-args.eval_freq:]) / args.eval_freq,
-                    'train/subgoal_loss': sum(logger.data["subgoal_loss"][-args.eval_freq:]) / args.eval_freq,
+                    'train/subgoal_loss': sum(logger.data["subgoal_loss"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "subgoal_loss" in logger.data and len(logger.data["subgoal_loss"]) > 0 else 0,
                     'train/train_critic_loss': sum(logger.data["critic_loss"][-args.eval_freq:]) / args.eval_freq,
-                    'train/critic_cost_loss': sum(logger.data["critic_cost_loss"][-args.eval_freq:]) / args.eval_freq if policy.safety else 0,
+                    'train/critic_cost_loss': sum(logger.data["critic_cost_loss"][-args.eval_freq:]) / args.eval_freq if policy.safety and "critic_cost_loss" in logger.data and len(logger.data["critic_cost_loss"]) > 0 else 0,
                     'train/critic_value': sum(logger.data["critic_value"][-args.eval_freq:]) / args.eval_freq,
                     'train/critic_grad_norm': sum(logger.data["critic_grad_norm"][-args.eval_freq:]) / args.eval_freq,
                     'train/target_value': sum(logger.data["target_value"][-args.eval_freq:]) / args.eval_freq,
                     'train/actor_loss': sum(logger.data["actor_loss"][-args.eval_freq:]) / args.eval_freq,
                     'train/actor_grad_norm': sum(logger.data["actor_grad_norm"][-args.eval_freq:]) / args.eval_freq,
-                    'train/safety_critic_value': sum(logger.data["safety_critic_value"][-args.eval_freq:]) / args.eval_freq if policy.safety else 0,
-                    'train/safety_target_value': sum(logger.data["safety_target_value"][-args.eval_freq:]) / args.eval_freq if policy.safety else 0,
-                    'train/critic_cost_grad_norm': sum(logger.data["critic_cost_grad_norm"][-args.eval_freq:]) / args.eval_freq if policy.safety else 0,
-                    'train/lambda_loss': sum(logger.data["lambda_loss"][-args.eval_freq:]) / args.eval_freq if policy.safety else 0,
-                    'train/subgoal_weight': sum(logger.data["subgoal_weight"][-args.eval_freq:]) / args.eval_freq,
-                    'train/subgoal_weight_max': sum(logger.data["subgoal_weight_max"][-args.eval_freq:]) / args.eval_freq,
-                    'train/subgoal_weight_min': sum(logger.data["subgoal_weight_min"][-args.eval_freq:]) / args.eval_freq,
-                    'train/log_prob_target_subgoal': sum(logger.data["log_prob_target_subgoal"][-args.eval_freq:]) / args.eval_freq,    
-                    'train/subgoal_grad_norm': sum(logger.data["subgoal_grad_norm"][-args.eval_freq:]) / args.eval_freq,
+                    'train/safety_critic_value': sum(logger.data["safety_critic_value"][-args.eval_freq:]) / args.eval_freq if policy.safety and "safety_critic_value" in logger.data and len(logger.data["safety_critic_value"]) > 0 else 0,
+                    'train/safety_target_value': sum(logger.data["safety_target_value"][-args.eval_freq:]) / args.eval_freq if policy.safety and "safety_target_value" in logger.data and len(logger.data["safety_target_value"]) > 0 else 0,
+                    'train/critic_cost_grad_norm': sum(logger.data["critic_cost_grad_norm"][-args.eval_freq:]) / args.eval_freq if policy.safety and "critic_cost_grad_norm" in logger.data and len(logger.data["critic_cost_grad_norm"]) > 0 else 0,
+                    'train/lambda_loss': sum(logger.data["lambda_loss"][-args.eval_freq:]) / args.eval_freq if policy.safety and "lambda_loss" in logger.data and len(logger.data["lambda_loss"]) > 0 else 0,
+                    # Subgoal metrics (only for RIS, not for SAC/SAC-Lagrangian)
+                    'train/subgoal_weight': sum(logger.data["subgoal_weight"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "subgoal_weight" in logger.data and len(logger.data["subgoal_weight"]) > 0 else 0,
+                    'train/subgoal_weight_max': sum(logger.data["subgoal_weight_max"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "subgoal_weight_max" in logger.data and len(logger.data["subgoal_weight_max"]) > 0 else 0,
+                    'train/subgoal_weight_min': sum(logger.data["subgoal_weight_min"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "subgoal_weight_min" in logger.data and len(logger.data["subgoal_weight_min"]) > 0 else 0,
+                    'train/log_prob_target_subgoal': sum(logger.data["log_prob_target_subgoal"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "log_prob_target_subgoal" in logger.data and len(logger.data["log_prob_target_subgoal"]) > 0 else 0,    
+                    'train/subgoal_grad_norm': sum(logger.data["subgoal_grad_norm"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "subgoal_grad_norm" in logger.data and len(logger.data["subgoal_grad_norm"]) > 0 else 0,
                      
                      # additional
                      'train/alpha': sum(logger.data["alpha"][-args.eval_freq:]) / args.eval_freq,
@@ -1326,9 +1332,9 @@ def train(args=None):
                      'train/log_entropy_sac': sum(logger.data["log_entropy_sac"][-args.eval_freq:]) / args.eval_freq,
                      'train/log_entropy_critic': sum(logger.data["log_entropy_critic"][-args.eval_freq:]) / args.eval_freq,
 
-                     # dubins filter
-                     'extra/init_dubins_distance': sum(logger.data["init_dubins_distance"][-args.eval_freq:]) / args.eval_freq,
-                     'extra/filtred_dubins_dinstance': sum(logger.data["filtred_dubins_dinstance"][-args.eval_freq:]) / args.eval_freq,
+                     # dubins filter (only for RIS with dubins filter, not for SAC/SAC-Lagrangian)
+                     'extra/init_dubins_distance': sum(logger.data["init_dubins_distance"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "init_dubins_distance" in logger.data and len(logger.data["init_dubins_distance"]) > 0 else 0,
+                     'extra/filtred_dubins_dinstance': sum(logger.data["filtred_dubins_dinstance"][-args.eval_freq:]) / args.eval_freq if not args.train_sac and "filtred_dubins_dinstance" in logger.data and len(logger.data["filtred_dubins_dinstance"]) > 0 else 0,
 
                      # validate logging
                      f'validation/val_distance({args.n_eval} episodes)': eval_distance,
