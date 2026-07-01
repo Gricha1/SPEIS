@@ -27,6 +27,14 @@ from polamp_env.lib.structures import State
 #from PythonRobotics.PathPlanning.DubinsPath import dubins_path_planner
 
 
+def to_obs_array(observation):
+    return np.asarray(observation, dtype=np.float32).reshape(-1)
+
+
+def to_torch_batch(batch, device):
+    return torch.FloatTensor(batch).to(device)
+
+
 def evalPolicy(policy, env, 
                plot_full_env=True, plot_subgoals=False, plot_value_function=False,
                value_function_angles=["theta_agent", np.pi, 0, np.pi/2, -np.pi/2],
@@ -937,13 +945,13 @@ def sample_and_preprocess_batch(replay_buffer, env, batch_size=256, device=torch
         assert ( (1.0 - 1.0 * collision_batch) + (1.0 * collision_batch) * (1.0 * done_batch) ).all()
 
     # Convert to Pytorch
-    state_batch         = torch.FloatTensor(state_batch).to(device)
-    action_batch        = torch.FloatTensor(action_batch).to(device)
-    reward_batch        = torch.FloatTensor(reward_batch).to(device)
-    cost_batch        = torch.FloatTensor(cost_batch).to(device)
-    next_state_batch    = torch.FloatTensor(next_state_batch).to(device)
-    done_batch          = torch.FloatTensor(done_batch).to(device)
-    goal_batch          = torch.FloatTensor(goal_batch).to(device)
+    state_batch         = to_torch_batch(state_batch, device)
+    action_batch        = to_torch_batch(action_batch, device)
+    reward_batch        = to_torch_batch(reward_batch, device)
+    cost_batch          = to_torch_batch(cost_batch, device)
+    next_state_batch    = to_torch_batch(next_state_batch, device)
+    done_batch          = to_torch_batch(done_batch, device)
+    goal_batch          = to_torch_batch(goal_batch, device)
 
     return state_batch, action_batch, reward_batch, cost_batch, next_state_batch, done_batch, goal_batch
 
@@ -1050,8 +1058,9 @@ def train(args=None):
         state_dim = args.state_dim 
     else:
         state_dim = env_obs_dim
+    print(f"policy state_dim: {state_dim}, use_encoder: {args.use_encoder}")
     folder = "results/{}/RIS/{}/".format(args.env, args.exp_name)
-    load_results = os.path.isdir(folder)
+    checkpoint_exists = os.path.isdir(folder)
 
     # Create logger
     logger = Logger(vars(args), save_git_head_hash=False)
@@ -1108,17 +1117,26 @@ def train(args=None):
     )
     path_builder = PathBuilder()
 
-    if load_results and not hyperparams_tune:
-        policy.load(folder)
-        print("weights is loaded")
+    if args.load_weights and checkpoint_exists and not hyperparams_tune:
+        try:
+            policy.load(folder)
+            print(f"weights loaded from {folder}")
+        except ValueError as exc:
+            print(f"WARNING: {exc}")
+            print("Training from scratch instead of loading checkpoint.")
     else:
-        print("WEIGHTS ISN'T LOADED")
+        if checkpoint_exists and not args.load_weights:
+            print(f"checkpoint exists at {folder}, but --load_weights not set; training from scratch")
+        else:
+            print("training from scratch (no checkpoint loaded)")
 
     # Initialize environment
     obs = env.reset()
     done = False
-    state = obs["observation"]
-    goal = obs["desired_goal"]
+    state = to_obs_array(obs["observation"])
+    goal = to_obs_array(obs["desired_goal"])
+    obs["observation"] = state
+    obs["desired_goal"] = goal
     
     # Add noise to initial observation if with_noise is enabled
     if args.with_noise:
@@ -1158,15 +1176,17 @@ def train(args=None):
             action = np.clip(action, -1.0, 1.0)
 
         # Perform action
-        next_obs, reward, done, train_info = env.step(action) 
-        next_state = next_obs["observation"]
-        next_agent_state = next_obs["state_observation"]
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        next_obs, reward, done, train_info = env.step(action)
+        next_state = to_obs_array(next_obs["observation"])
+        next_agent_state = to_obs_array(next_obs["state_observation"])
+        next_obs["observation"] = next_state
+        next_obs["state_observation"] = next_agent_state
         
         # Add noise to observation if with_noise is enabled
         if args.with_noise:
             obs_noise = np.random.normal(0, args.obs_noise_std, size=next_state.shape)
             next_state = next_state + obs_noise
-            # Update next_obs with noisy observation
             next_obs["observation"] = next_state
         
         cumulative_reward += reward
@@ -1196,7 +1216,7 @@ def train(args=None):
                 device=args.device
             )
             # Sample subgoal candidates uniformly in the replay buffer
-            subgoal_batch = torch.FloatTensor(replay_buffer.random_state_batch(args.batch_size)).to(args.device)
+            subgoal_batch = to_torch_batch(replay_buffer.random_state_batch(args.batch_size), args.device)
             policy.train(state_batch, action_batch, reward_batch, cost_batch, next_state_batch, done_batch, goal_batch, subgoal_batch)
             if t % 1e4 == 0:
                 print("train", args.exp_name, end=" ")
@@ -1224,13 +1244,16 @@ def train(args=None):
             # Reset environment
             obs = env.reset()
             done = False
-            state = obs["observation"]
-            goal = obs["desired_goal"]
+            state = to_obs_array(obs["observation"])
+            goal = to_obs_array(obs["desired_goal"])
+            obs["observation"] = state
+            obs["desired_goal"] = goal
             
             # Add noise to observation if with_noise is enabled
             if args.with_noise:
                 obs_noise = np.random.normal(0, args.obs_noise_std, size=state.shape)
                 state = state + obs_noise
+                obs["observation"] = state
             
             episode_timesteps = 0
             episode_num += 1 
@@ -1530,6 +1553,8 @@ if __name__ == "__main__":
     parser.add_argument("--device",             default="cuda")
     parser.add_argument("--seed",               default=42, type=int) # 42
     parser.add_argument("--exp_name",           default="RIS_ant")
+    parser.add_argument("--load_weights",       action="store_true",
+                        help="Resume from results/{env}/RIS/{exp_name}/ (off by default)")
     parser.add_argument("--alpha",              default=1.76, type=float)
     parser.add_argument("--Lambda",             default=0.29, type=float) # 0.1
     parser.add_argument("--n_ensemble",         default=10, type=int) # 10
@@ -1555,6 +1580,8 @@ if __name__ == "__main__":
     # encoder
     parser.add_argument("--use_decoder",             default=True, type=bool)
     parser.add_argument("--use_encoder",             default=True, type=bool)
+    parser.add_argument("--no_encoder", dest="use_encoder", action="store_false")
+    parser.add_argument("--no_decoder", dest="use_decoder", action="store_false")
     parser.add_argument("--state_dim",               default=40, type=int) # 20
 
     # safety

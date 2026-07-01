@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -200,9 +201,10 @@ class RIS(object):
 		self.critic.load_state_dict(torch.load(folder+run_name+"critic.pth", map_location=self.device))
 		if self.safety:
 			self.critic_cost.load_state_dict(torch.load(folder+run_name+"critic_cost.pth", map_location=self.device))
-		# Only load subgoal_net if it exists (i.e., not for SAC-Lagrangian)
-		if self.subgoal_net is not None:
-			self.subgoal_net.load_state_dict(torch.load(folder+run_name+"subgoal_net.pth", map_location=self.device))
+		# Only load subgoal_net if it exists on disk (SAC/SAC-Lagrangian don't have it)
+		subgoal_path = folder + run_name + "subgoal_net.pth"
+		if self.subgoal_net is not None and os.path.isfile(subgoal_path):
+			self.subgoal_net.load_state_dict(torch.load(subgoal_path, map_location=self.device))
 		if self.use_encoder:
 			self.encoder.load_state_dict(torch.load(folder+run_name+"encoder.pth", map_location=self.device))
 		if self.use_lidar_predictor:
